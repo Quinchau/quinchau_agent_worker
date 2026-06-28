@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+sqlalchemy
+pymysql
+redis
+rq
+python-dotenv
+openai>=1.0.0
+httpx
+Pillow>=10.0.0
