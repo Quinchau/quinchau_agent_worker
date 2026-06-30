@@ -29,6 +29,8 @@ class AgentStateManager:
             "ultimo_modelo": None,
             "productos_mencionados": [],
             "entidades_no_resueltas": [],
+            "intentos_resolucion": 0,
+            "status_conversacion": "active",  # active | paused
             "ultimos_turnos": [],
             "turno_actual": 0,
             "id_usuario": contact_id,
