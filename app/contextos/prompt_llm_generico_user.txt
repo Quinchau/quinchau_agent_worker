@@ -1,0 +1,5 @@
+Mensaje del cliente: {message}
+
+Intención detectada: {intencion}
+
+Responde de forma natural y útil para el cliente.

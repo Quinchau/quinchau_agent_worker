@@ -1,10 +1,3 @@
-"""
-Tasks dispatcher.
-
-En producción los jobs se encolan en Redis para que el worker los ejecute.
-En modo SYNC_MODE=true ejecuta directo (útil para tests o ambientes sin Redis).
-"""
-
 import os
 import logging
 import httpx
@@ -29,13 +22,70 @@ logger = logging.getLogger(__name__)
 SYNC_MODE = os.getenv("SYNC_MODE", "false").lower() == "true"
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
+PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "contextos")
+
 # ============================================
 # CONFIGURACIÓN DE CATÁLOGO
 # ============================================
 
-INTENCIONES_CON_CATALOGO = ['intencion_compra_repuestos', 'consulta_disponibilidad', 'intencion_compra', 'consulta_precio']
 CATALOG_ENDPOINT = os.getenv("CATALOG_ENDPOINT", "http://backend:8000/products/internal/resolve-by-entities")
+CATALOG_URL_ENDPOINT = os.getenv("CATALOG_URL_ENDPOINT", "http://quinchau-api:3003/api/agent/catalog-url") 
 CATALOG_TIMEOUT = float(os.getenv("CATALOG_TIMEOUT", "3.0"))
+
+# ============================================
+# HELPER: CARGA DE PROMPTS
+# ============================================
+
+def load_prompt(name: str, **kwargs) -> str:
+    """
+    Carga un prompt desde contextos/<name>.txt e inyecta variables con .format().
+    Los campos opcionales que no se pasen se reemplazan por cadena vacía.
+    """
+    path = os.path.join(PROMPTS_DIR, f"{name}.txt")
+    with open(path, "r", encoding="utf-8") as f:
+        template = f.read()
+
+    class _SafeDict(dict):
+        def __missing__(self, key):
+            return ""
+
+    return template.format_map(_SafeDict(**kwargs))
+
+def get_catalog_url_for_model(modelo: str) -> dict:
+    """
+    Obtiene la URL del catálogo para un modelo específico usando el endpoint dedicado.
+    GET /api/agent/catalog-url/:modelo
+    """
+    try:
+        with httpx.Client(timeout=CATALOG_TIMEOUT) as client:
+            # 🔥 Usar el endpoint GET dedicado
+            response = client.get(
+                f"{CATALOG_URL_ENDPOINT}/{modelo}"
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('success') and data.get('data'):
+                catalog_data = data['data']
+                return {
+                    'found': True,
+                    'url': catalog_data.get('url'),
+                    'modelo': catalog_data.get('modelo'),
+                    'idmodelo': catalog_data.get('idmodelo'),
+                    'marca': catalog_data.get('marca'),
+                    'modeldescrip': catalog_data.get('modeldescrip')
+                }
+            return None
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            logger.warning(f"⚠️ Modelo '{modelo}' no encontrado en el catálogo")
+        else:
+            logger.error(f"❌ Error HTTP obteniendo URL del catálogo: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo URL del catálogo para '{modelo}': {e}")
+        return None
+
 
 # ============================================
 # TAREAS PÚBLICAS (FastAPI)
@@ -151,19 +201,48 @@ def resolver_y_responder_catalogo(state, contact_id, intencion, channel):
         resultados = data.get('results', [])
 
         if not resultados:
-            respuesta = f"No encontré '{producto}' para {modelo}. ¿Podrías verificar el nombre del producto?"
-            send_message_to_ghl(contact_id, respuesta, channel)
+            # 🔥 FALLBACK: Usar la URL del catálogo que devuelve el backend
+            catalog_url = data.get('url')  # ✅ El backend ya la proporciona
+            
+            if catalog_url:
+                # 🔥 Dividir en 2 mensajes
+                mensajes = [
+                    f"No encontré '{producto}' específicamente para {modelo.upper()}. "
+                    f"Te invito a revisar el catálogo completo de {modelo.upper()}:",
+                    catalog_url
+                ]
+                logger.info(f"📦 URL del catálogo enviada: {catalog_url}")
+            else:
+                # Fallback absoluto si el backend no devuelve URL
+                modelo_key = modelo.lower().replace(' ', '')
+                mensajes = [
+                    f"No encontré '{producto}' para {modelo.upper()}. "
+                    f"Por favor, verifica el nombre del producto.",
+                    "https://quinchau.com/repuestos-motos"
+                ]
+            
+            # Enviar múltiples mensajes
+            send_multiple_messages(contact_id, mensajes, channel, delay=0.5)
 
             state_manager = AgentStateManager()
             state_manager.update_state(contact_id, {
                 'producto': None,
                 'entidades_no_resueltas': [],
                 'ultimo_producto_consultado': producto,
-                'ultimo_modelo_consultado': modelo
+                'ultimo_modelo_consultado': modelo,
+                'ultimo_catalogo_enviado': catalog_url if catalog_url else None
             })
             logger.info(f"🧹 Producto limpiado (no encontrado), modelo mantenido para contexto")
 
-            return {"success": True, "response": respuesta}
+            return {
+                "success": True, 
+                "response": mensajes,
+                "contact_id": contact_id,
+                "intencion": intencion,
+                "fallback": True,
+                "catalogo_url": catalog_url if catalog_url else None,
+                "processed_at": datetime.now().isoformat()
+            }
 
         # ============================================
         # CASO 1: UN SOLO PRODUCTO - URL DIRECTA
@@ -211,41 +290,15 @@ def resolver_y_responder_catalogo(state, contact_id, intencion, channel):
                 historial_texto += f"Cliente: {t['cliente']}\n"
                 historial_texto += f"Asistente: {t['asistente']}\n\n"
 
-        prompt_seleccion = f"""
-        Eres Quinchau Assistant, asistente conversacional.
-        El cliente se llama {state.get('nombre_cliente', 'Cliente')}.
-
-        CONTEXTO:
-        - Producto buscado: {producto}
-        - Modelo: {modelo}
-        - Intención: {intencion}
-
-        {historial_texto}
-
-        PRODUCTOS ENCONTRADOS:
-        {productos_texto}
-
-        INSTRUCCIONES:
-        1. Analiza el contexto de la conversación.
-        2. Elige el producto que MEJOR responda a la pregunta del cliente.
-        3. ⚠️ PRIORIZA productos con STOCK DISPONIBLE (stock > 0).
-        4. Si el cliente pidió algo específico (ej: "izquierdo", "derecho"), elige ese.
-        5. Si hay múltiples opciones con stock, elige la que tenga mayor stock.
-        6. Si ningún producto tiene stock, elige el más relevante.
-        7. Responde con un JSON con el producto seleccionado.
-
-        RESPUESTA EN JSON:
-        {{
-            "seleccionado": true/false,
-            "stockid": "259-897",
-            "description": "Mando Izquierdo HJ110",
-            "url": "https://quinchau.com/producto/259-897/mando-izquierdo-hj110",
-            "stock": 5,
-            "razon": "El cliente preguntó por 'el izquierdo', y este es el mando izquierdo con stock disponible"
-        }}
-
-        Si ningún producto es relevante, responde con seleccionado=false.
-        """
+        prompt_seleccion = load_prompt(
+            "prompt_seleccion_catalogo",
+            nombre_cliente=state.get('nombre_cliente', 'Cliente'),
+            producto=producto,
+            modelo=modelo,
+            intencion=intencion,
+            historial_texto=historial_texto,
+            productos_texto=productos_texto,
+        )
 
         llm_client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
@@ -404,6 +457,8 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             contexto_estado += f"Última intención: {state['ultima_intencion']}\n"
         if state.get('entidades_no_resueltas'):
             contexto_estado += f"Entidades pendientes: {state['entidades_no_resueltas']}\n"
+        if not contexto_estado:
+            contexto_estado = "No hay contexto previo."
 
         historial_texto = ""
         turnos = state.get('ultimos_turnos', [])
@@ -416,43 +471,24 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                     historial_texto += f"Cliente: {cliente}\n"
                     historial_texto += f"Asistente: {asistente}\n\n"
 
-        intent_prompt = f"""
-        Eres un clasificador de intenciones para una tienda de motos llamada Quinchau Motos.
-
-        {historial_texto}
-
-        CONTEXTO DE LA CONVERSACIÓN:
-        {contexto_estado if contexto_estado else "No hay contexto previo."}
-
-        MENSAJE DEL CLIENTE: "{message}"
-
-        INTENCIONES POSIBLES:
-        {intenciones_texto}
-
-        INSTRUCCIONES:
-        Clasifica la intención del cliente basándote en el mensaje actual y el contexto de la conversación.
-
-        Considera lo siguiente:
-        - Un saludo sin más información es solo un saludo.
-        - Un saludo que introduce un tema comercial tiene intención comercial.
-        - El contexto de la conversación es importante, pero no debe sobreescribir un mensaje claramente diferente.
-        - Usa tu juicio para interpretar lo que el cliente realmente quiere.
-
-        Responde SOLO con un JSON válido.
-
-        RESPUESTA EN JSON:
-        {{
-            "intencion": "nombre_de_la_intencion",
-            "confianza": 0.95,
-            "entidades_detectadas": {{}},
-            "razon": "explicación breve de por qué elegiste esta intención"
-        }}
-        """
-
         client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
+
+        intent_prompt = load_prompt(
+            "prompt_intent_classifier",
+            historial_texto=historial_texto,
+            contexto_estado=contexto_estado,
+            message=message,
+            intenciones_texto=intenciones_texto,
+        )
+
+        logger.info("=" * 60)
+        logger.info("📝 PROMPT COMPLETO PARA CLASIFICACIÓN DE INTENCIÓN:")
+        logger.info("-" * 40)
+        logger.info(intent_prompt)
+        logger.info("=" * 60)
 
         intent_response = client.chat.completions.create(
             model="openai/gpt-4o-mini",
@@ -486,8 +522,6 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
 
         # ============================================
         # 5. EJECUTAR ACCIÓN SEGÚN INTENCIÓN
-        # Cadena if/elif unificada — cada rama tiene return propio.
-        # El LLM genérico (paso 6) solo se alcanza si ninguna rama coincide.
         # ============================================
 
         if intencion == 'sin_clasificar':
@@ -513,7 +547,9 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 "status": "paused",
                 "processed_at": datetime.now().isoformat()
             }
-
+        # ============================================
+        # 5.1 Intencion
+        # ============================================
         elif intencion == 'intencion_cotizar_envio':
             logger.info(f"📦 Cotización de envío detectada")
 
@@ -523,21 +559,11 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             match = re.search(r'a\s+([A-Za-záéíóúñ\s]+)', message, re.IGNORECASE)
             ciudad = match.group(1).strip() if match else "tu ubicación"
 
-            prompt_cotizar = f"""
-            Eres Quinchau Assistant, asistente de ventas.
-            El cliente {nombre} pregunta cuánto cuesta el envío a {ciudad}.
-
-            INFORMACIÓN DE ENVÍOS:
-            - Despachamos a todo el país por ZOOM
-            - El costo de envío varía según la ubicación y el peso
-            - Para Maracay: envío el mismo día (si se confirma antes de las 2 PM)
-            - El costo aproximado es de $3-$5 para envíos locales
-
-            INSTRUCCIONES:
-            - Responde de forma amable y breve (máximo 30 palabras).
-            - Si la ubicación es Maracay, menciona el envío el mismo día.
-            - Pregunta si necesita cotización exacta con el producto.
-            """
+            prompt_cotizar = load_prompt(
+                "prompt_intencion_cotizar_envio",
+                nombre=nombre,
+                ciudad=ciudad,
+            )
 
             respuesta = client.chat.completions.create(
                 model="openai/gpt-4o-mini",
@@ -563,24 +589,18 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 "ubicacion": ciudad,
                 "processed_at": datetime.now().isoformat()
             }
-
+        # ============================================
+        # 5.2 Intencion
+        # ============================================
         elif intencion == 'intencion_retiro_y_pago_personal':
             logger.info(f"🏪 Retiro y pago personal detectado")
 
             nombre = state.get('nombre_cliente', 'Cliente')
 
-            prompt_retiro = f"""
-            Eres Quinchau Assistant, asistente de ventas.
-            El cliente {nombre} pregunta si puede retirar y pagar personalmente.
-
-            INFORMACIÓN DE RETIRO:
-            - Puede retirar y pagar personalmente en El Limón, Maracay
-            - Dirección: Panadería Marin Pan, frente a Banesco
-            - Horario: Lunes a Sábado de 8:00 AM a 6:00 PM
-
-            Responde de forma amable, breve y personalizada (máximo 30 palabras).
-            Confirma la dirección y horario.
-            """
+            prompt_retiro = load_prompt(
+                "prompt_intencion_retiro_y_pago_personal",
+                nombre=nombre,
+            )
 
             respuesta = client.chat.completions.create(
                 model="openai/gpt-4o-mini",
@@ -600,29 +620,19 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 "intencion": intencion,
                 "processed_at": datetime.now().isoformat()
             }
-
+        # ============================================
+        # 5.3 Intencion
+        # ============================================
         elif intencion == 'intencion_envio_por_delivery':
             logger.info(f"📦 Envío por delivery detectado")
 
             ciudad = state.get('ubicacion', 'tu ciudad')
             nombre = state.get('nombre_cliente', 'Cliente')
 
-            system_prompt = f"""
-            Eres Quinchau Assistant, un asistente de ventas.
-            El cliente {nombre} pregunta si hacen delivery.
-
-            📦 INFORMACIÓN DE ENVÍOS (DEBES USAR ESTA INFORMACIÓN EXACTA):
-            - Despachamos a todo el país por ZOOM
-            - Entregas Gratis en El Limón, Maracay
-            - Delivery solo a la ciudad de Maracay - centro, Costo $5
-            - Para otras ubicaciones, el costo varía según la distancia
-
-            INSTRUCCIONES:
-            - Responde de forma amable, breve y personalizada.
-            - MENCIONA OBLIGATORIAMENTE la información de envíos.
-            - Si el cliente está en Maracay, menciona el costo de $5.
-            - Pregunta si necesita más detalles sobre el envío.
-            """
+            system_prompt = load_prompt(
+                "prompt_intencion_envio_por_delivery",
+                nombre=nombre,
+            )
 
             respuesta = client.chat.completions.create(
                 model="openai/gpt-4o-mini",
@@ -648,30 +658,57 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 "intencion": intencion,
                 "processed_at": datetime.now().isoformat()
             }
-
+        # ============================================
+        # 5.4 Intencion
+        # ============================================
         elif intencion == 'intencion_saludo':
-            logger.info(f"👋 Saludo detectado")
-
-            system_prompt = f"""
-            Eres Quinchau Assistant, un asistente amable.
-            Responde con un saludo breve y cálido (máximo 15 palabras),
-            preguntando cómo puedes ayudarlo.
-            """
-
-            respuesta = client.chat.completions.create(
+            logger.info(f"👋 Saludo o agradecimiento detectado - {first_name} {last_name}")
+            
+            system_prompt = load_prompt(
+                "prompt_intencion_saludo",
+                first_name=first_name,
+                historial_texto=historial_texto
+            )
+            
+            llm_response = client.chat.completions.create(
                 model="openai/gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"El cliente {first_name} dice: \"{message}\""}
                 ],
-                temperature=0.5,
+                temperature=0.3,
                 max_tokens=60,
-            ).choices[0].message.content.strip()
-
+            )
+            
+            respuesta = llm_response.choices[0].message.content.strip()
+            
+            es_duplicado = "SALUDO_DUPLICADO" in respuesta or "{SALUDO_DUPLICADO}" in respuesta
+            
+            if es_duplicado:
+                logger.info(f"🔄 Saludo duplicado ignorado (sin respuesta)")
+                logger.debug(f"   Respuesta LLM: {respuesta}")  # Solo en debug si necesitas
+                
+                state_manager.add_turno(contact_id, message, "[IGNORADO - Saludo duplicado]")
+                state_manager.update_state(contact_id, {
+                    'ultima_intencion': intencion,
+                    'saludo_duplicado_ignorado': True,
+                    'ultimo_saludo_ignorado': datetime.now().isoformat()
+                })
+                
+                return {
+                    "success": True,
+                    "ignored": True,
+                    "contact_id": contact_id,
+                    "intencion": intencion,
+                    "reason": "saludo_duplicado",
+                    "processed_at": datetime.now().isoformat()
+                }
+            
+            logger.info(f"✅ Saludo enviado: {respuesta[:40]}...")
+            
             send_message_to_ghl(contact_id, respuesta, channel)
-
-            state_manager.update_state(contact_id, {'ultima_intencion': intencion})
             state_manager.add_turno(contact_id, message, respuesta)
+            state_manager.update_state(contact_id, {'ultima_intencion': intencion})
 
             return {
                 "success": True,
@@ -680,7 +717,9 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 "intencion": intencion,
                 "processed_at": datetime.now().isoformat()
             }
-
+        # ============================================
+        # 5.5 Intencion
+        # ============================================
         elif intencion == 'intencion_compra_al_mayoreo':
             logger.info(f"📦 Compra al mayoreo detectada → respuesta directa")
 
@@ -705,28 +744,17 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 "intencion": intencion,
                 "processed_at": datetime.now().isoformat()
             }
-
+        # ============================================
+        # 5.6 Intencion
+        # ============================================
         elif intencion == 'consulta_ubicacion_horario':
             logger.info(f"📍 Procesando consulta de ubicación/horario")
 
-            prompt_ubicacion = f"""
-            Eres Quinchau Assistant, asistente conversacional amable.
-            El cliente se llama {first_name}.
-
-            📍 INFORMACIÓN DE LA TIENDA:
-            - QuinChau Motos comercializa todos sus productos On Line
-            - No somos tienda Fisica, despachamos a todo el país por ZOOM
-            - Puede retirar y pagar personalmente su pedido en el Limon, Maracay
-            - Panadería Marin Pan, frente a Banesco
-            - Horario: Lunes a Sábado de 8:00 AM a 6:00 PM
-            - Domingo: Cerrado
-            - Teléfono: +5841244307657
-
-            PREGUNTA DEL CLIENTE: "{message}"
-
-            Responde de forma natural, amable y completa.
-            Se breve y puntual en tu respuesta.
-            """
+            prompt_ubicacion = load_prompt(
+                "prompt_consulta_ubicacion_horario",
+                first_name=first_name,
+                message=message,
+            )
 
             respuesta = client.chat.completions.create(
                 model="openai/gpt-4o-mini",
@@ -750,28 +778,17 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 "intencion": intencion,
                 "processed_at": datetime.now().isoformat()
             }
-
+        # ============================================
+        # 5.7 Intencion
+        # ============================================
         elif intencion == 'orden_sin_despacho':
             logger.info(f"📦 Procesando consulta de retiro de pedido")
 
-            prompt_retiro = f"""
-            Eres Quinchau Assistant, asistente conversacional amable.
-            El cliente se llama {first_name}.
-
-            📦 INFORMACIÓN DE RETIRO DE PEDIDOS:
-            - QuinChau Motos comercializa todos sus productos On Line
-            - No somos tienda Física, despachamos a todo el país por ZOOM
-            - Puede retirar y pagar personalmente su pedido en El Limón, Maracay
-            - Panadería Marin Pan, frente a Banesco
-            - Horario de retiro: Lunes a Sábado de 8:00 AM a 6:00 PM
-            - Teléfono de contacto: +5841244307657
-
-            PREGUNTA DEL CLIENTE: "{message}"
-
-            INSTRUCCIONES:
-            1. Responde de forma natural, no agregues informacion adicional.
-            2. Sé breve y puntual en tu respuesta.
-            """
+            prompt_retiro = load_prompt(
+                "prompt_orden_sin_despacho",
+                first_name=first_name,
+                message=message,
+            )
 
             respuesta = client.chat.completions.create(
                 model="openai/gpt-4o-mini",
@@ -790,9 +807,11 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 "intencion": intencion,
                 "processed_at": datetime.now().isoformat()
             }
-
-        elif intencion in INTENCIONES_CON_CATALOGO:
-            logger.info(f"🔍 Procesando consulta de catálogo para: {intencion}")
+        # ============================================
+        # 5.8 Intencion
+        # ============================================
+        elif intencion == 'intencion_compra':
+            logger.info(f"🔍 Procesando consulta de catálogo (compra/disponibilidad/precio)")
 
             intentos_resolucion = state.get('intentos_resolucion', 0)
 
@@ -811,21 +830,60 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                     logger.warning(f"🚨 Límite de 3 intentos alcanzado. Activando fallback.")
 
                     modelo = state.get('modelo')
+                    producto = state.get('producto')
                     nombre = state.get('nombre_cliente', 'cliente')
 
                     if modelo:
-                        url = f"https://quinchau.com/catalogo?modelo={modelo}"
-                        mensaje_fallback = (
-                            f"No he logrado identificar la pieza que buscas para tu {modelo}. "
-                            f"Te invito a revisar el catálogo completo de tu modelo en este enlace: "
-                            f"{url}. Allí podrás visualizar todos los productos disponibles."
-                        )
+                        # 🔥 Obtener URL del catálogo del modelo desde el backend
+                        catalog_info = get_catalog_url_for_model(modelo)
+                        
+                        if catalog_info and catalog_info.get('found'):
+                            catalogo_url = catalog_info.get('url')
+                            modeldescrip = catalog_info.get('modeldescrip', modelo)
+                            
+                            if not producto or producto == 'None':
+                                mensajes = [
+                                    f"📋 No encuentro el producto por la definición que me das, te dejo el catálogo completo de {modeldescrip} para que intentes buscarlo tu mismo:",
+                                    catalogo_url
+                                ]
+                            else:
+                                mensajes = [
+                                    f"🔍 No encontré '{producto}' específicamente para {modeldescrip}. Te invito a revisar el catálogo completo de {modeldescrip}:",
+                                    catalogo_url
+                                ]
+                            logger.info(f"📦 URL del catálogo obtenida del backend: {catalogo_url}")
+                            
+                        else:
+                            # ⚠️ Fallback: No se pudo obtener URL del backend
+                            # Usar URL genérica como último recurso
+                            catalogo_url = None
+                            logger.warning(f"⚠️ No se pudo obtener URL del backend para {modelo}")
+                            
+                            if not producto or producto == 'None':
+                                mensajes = [
+                                    f"📋 No encuentro el producto por la definición que me das. Te invito a revisar el catálogo completo de {modelo}:",
+                                    f"https://quinchau.com/repuestos-motos"
+                                ]
+                            else:
+                                mensajes = [
+                                    f"🔍 No encontré '{producto}' para {modelo}. Te invito a revisar el catálogo completo de {modelo}:",
+                                    f"https://quinchau.com/repuestos-motos"
+                                ]
+                        
+                        send_multiple_messages(contact_id, mensajes, channel, delay=0.5)
+                        response_data = mensajes
+                        mensaje_fallback = " ".join(mensajes)
+                        
                     else:
-                        url_general = "https://quinchau.com"
                         mensaje_fallback = (
-                            f"No he logrado identificar la pieza que buscas. "
-                            f"Te invito a revisar nuestro catálogo general en: {url_general}"
+                            f"📋 No he logrado identificar la pieza que buscas. "
+                            f"Te invito a revisar nuestro catálogo general en: https://quinchau.com"
                         )
+                        send_message_to_ghl(contact_id, mensaje_fallback, channel)
+                        response_data = mensaje_fallback
+
+                    # 🔥 Guardar turno
+                    state_manager.add_turno(contact_id, message, mensaje_fallback)
 
                     state_manager.update_state(contact_id, {
                         "intentos_resolucion": 0,
@@ -834,16 +892,17 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                         "ultimo_fallback": datetime.now().isoformat()
                     })
 
-                    send_message_to_ghl(contact_id, mensaje_fallback, channel)
-                    logger.info(f"📤 Fallback enviado: {mensaje_fallback[:100]}...")
+                    logger.info(f"📤 Fallback enviado para {contact_id}")
 
                     return {
                         "success": True,
-                        "response": mensaje_fallback,
+                        "response": response_data,
                         "contact_id": contact_id,
                         "intencion": intencion,
                         "fallback": True,
                         "modelo_contexto": modelo,
+                        "producto_contexto": producto,
+                        "catalogo_url": catalogo_url if catalogo_url else None,
                         "processed_at": datetime.now().isoformat()
                     }
 
@@ -862,24 +921,15 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     contexto_faltantes = "Faltan determinar producto y modelo."
 
-                prompt_pregunta = f"""
-                Eres Quinchau Assistant, asistente conversacional amable.
-                El cliente se llama {first_name} {last_name}.
-
-                {contexto_faltantes}
-
-                Mensaje del cliente: "{message}"
-                Intención detectada: {intencion}
-                Entidades faltantes: {faltantes}
-
-                INSTRUCCIONES:
-                Genera UNA SOLA PREGUNTA natural para pedir al cliente que aclare lo que falta.
-                - Sé amable, específico y personalizado (usa el nombre del cliente).
-                - Si el cliente mencionó un producto, pregunta por el MODELO DE LA MOTO.
-                - Si el cliente mencionó un modelo, pregunta por el producto.
-                - Si no mencionó nada, pregunta por ambos.
-                - No incluyas saludos adicionales, solo la pregunta.
-                """
+                prompt_pregunta = load_prompt(
+                    "prompt_entidades_faltantes",
+                    first_name=first_name,
+                    last_name=last_name,
+                    contexto_faltantes=contexto_faltantes,
+                    message=message,
+                    intencion=intencion,
+                    faltantes=faltantes,
+                )
 
                 pregunta = client.chat.completions.create(
                     model="openai/gpt-4o-mini",
@@ -887,6 +937,9 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                     temperature=0.5,
                     max_tokens=80,
                 ).choices[0].message.content.strip()
+
+                # 🔥 GUARDAR EL TURNO CON LA PREGUNTA
+                state_manager.add_turno(contact_id, message, pregunta)
 
                 state_manager.update_state(contact_id, {
                     "entidades_no_resueltas": faltantes,
@@ -919,17 +972,14 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             if catalog_result:
                 return catalog_result
 
-            # ⚠️ Catálogo falló — caer al LLM genérico (paso 6)
+            # ⚠️ Catálogo falló — caer al LLM genérico
             logger.warning("⚠️ Catálogo falló, usando LLM como fallback")
 
         else:
-            # Intención desconocida no mapeada → LLM genérico
             logger.info(f"ℹ️ Intención '{intencion}' no tiene rama específica, usando LLM genérico")
 
         # ============================================
         # 6. LLM GENÉRICO (fallback o intenciones sin rama propia)
-        # Solo se llega aquí si ninguna rama anterior hizo return,
-        # o si el catálogo falló.
         # ============================================
 
         entidades_texto = ""
@@ -945,6 +995,8 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             entidades_texto += f"- Envío consultado: {state['envio']}\n"
         if state.get('pago'):
             entidades_texto += f"- Método de pago consultado: {state['pago']}\n"
+        if not entidades_texto:
+            entidades_texto = "Aún no tenemos información específica del cliente en esta conversación."
 
         turnos = state.get('ultimos_turnos', [])[-4:]
         historial_texto = ""
@@ -953,34 +1005,23 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             for t in turnos:
                 historial_texto += f"Cliente: {t['cliente']}\n"
                 historial_texto += f"Asistente: {t['asistente']}\n\n"
+        if not historial_texto:
+            historial_texto = "No hay historial reciente de conversación."
 
-        system_prompt = f"""
-        Eres Quinchau Assistant, un asistente conversacional amable y profesional de Quinchau Motos, una tienda de motos y repuestos.
+        system_prompt = load_prompt(
+            "prompt_llm_generico_system",
+            first_name=first_name,
+            last_name=last_name,
+            contact_id=contact_id,
+            entidades_texto=entidades_texto,
+            historial_texto=historial_texto,
+        )
 
-        DATOS DEL CLIENTE:
-        - Nombre: {first_name} {last_name}
-        - ID: {contact_id}
-
-        INFORMACIÓN CONOCIDA DEL CLIENTE:
-        {entidades_texto if entidades_texto else "Aún no tenemos información específica del cliente en esta conversación."}
-
-        {historial_texto if historial_texto else "No hay historial reciente de conversación."}
-
-        REGLAS IMPORTANTES:
-        1. Responde de manera AMABLE, PROFESIONAL y CONCISA.
-        2. Usa el nombre del cliente para personalizar la respuesta.
-        3. NO adivines productos, precios o disponibilidad que no estén confirmados.
-        4. Si no tienes información suficiente, pregunta de forma natural.
-        5. Mantén un tono cálido y servicial.
-        """
-
-        user_prompt = f"""
-        Mensaje del cliente: {message}
-
-        Intención detectada: {intencion}
-
-        Responde de forma natural y útil para el cliente.
-        """
+        user_prompt = load_prompt(
+            "prompt_llm_generico_user",
+            message=message,
+            intencion=intencion,
+        )
 
         logger.info("=" * 60)
         logger.info("📝 PROMPT DEL LLM:")

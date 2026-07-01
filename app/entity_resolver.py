@@ -36,8 +36,15 @@ class EntityResolver:
         normalized = self.normalize_text(message)
         matches = []
         seen_terminos = set()
+        covered_spans = []  # rangos (start, end) ya cubiertos por un match más específico
 
         all_patterns = self.cache.get_terminos_patterns()
+
+        # 🔑 FIX: ordenar por longitud de patrón (desc) para que los alias
+        # más específicos ("embrague arranque") se evalúen ANTES que los
+        # genéricos ("arranque"). Así el término correcto reserva su
+        # porción del texto antes de que un alias corto intente matchearla.
+        all_patterns = sorted(all_patterns, key=lambda x: len(x['pattern']), reverse=True)
 
         for item in all_patterns:
             pattern = item['pattern']
@@ -47,8 +54,18 @@ class EntityResolver:
                 continue
 
             pattern_regex = r'\b' + re.escape(pattern) + r'\b'
-            if re.search(pattern_regex, normalized):
+            for m in re.finditer(pattern_regex, normalized):
+                start, end = m.span()
+
+                # 🔑 FIX: si este rango de texto ya fue cubierto por un
+                # match más específico (más largo), lo ignoramos. Esto
+                # evita que "arranque" (alias de Motor Arranque) matchee
+                # dentro de "embrague arranque" ya asignado a CREMALLERA.
+                if any(start < c_end and end > c_start for c_start, c_end in covered_spans):
+                    continue
+
                 seen_terminos.add(termino)
+                covered_spans.append((start, end))
                 matches.append({
                     'termino_id': item['termino_id'],
                     'termino': termino,
@@ -57,6 +74,7 @@ class EntityResolver:
                     'alias': pattern
                 })
                 logger.debug(f"✅ Match: '{pattern}' → término '{termino}'")
+                break  # con un match de este patrón alcanza
 
         logger.info(f"🔍 Encontrados {len(matches)} matches en mensaje")
         return matches
