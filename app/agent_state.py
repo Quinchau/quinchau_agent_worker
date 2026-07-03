@@ -31,8 +31,6 @@ class AgentStateManager:
             "entidades_no_resueltas": [],
             "intentos_resolucion": 0,
             "status_conversacion": "active",  # active | paused
-            "ultimos_turnos": [],
-            "turno_actual": 0,
             "id_usuario": contact_id,
             "nombre_cliente": contact_data.get("first_name", ""),
             "telefono_cliente": contact_data.get("phone", ""),
@@ -66,22 +64,3 @@ class AgentStateManager:
         self.redis.setex(state_key, 86400, json.dumps(current, default=str))
         return current
     
-    def add_turno(self, contact_id, mensaje_cliente, respuesta_asistente):
-        state = self.get_state(contact_id)
-        if not state:
-            return
-        
-        turnos = state.get("ultimos_turnos", [])
-        turnos.append({
-            "cliente": mensaje_cliente,
-            "asistente": respuesta_asistente,
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        if len(turnos) > 10:
-            turnos = turnos[-10:]
-        
-        self.update_state(contact_id, {
-            "ultimos_turnos": turnos,
-            "turno_actual": len(turnos)
-        })
