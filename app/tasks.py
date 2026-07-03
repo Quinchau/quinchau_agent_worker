@@ -10,7 +10,6 @@ from .redis_queue import get_queue, QUEUE_HIGH, QUEUE_AI, get_redis
 from .jobs import job_classify_user_preference, job_general_chat
 from .agent_state import AgentStateManager
 from .entity_resolver import EntityResolver
-from .intent_classifier import IntentClassifier
 from .catalog_cache import CatalogCache
 from .prompts import load_prompt
 from .intenciones import IntentContext, obtener_manejador
@@ -24,13 +23,16 @@ logger = logging.getLogger(__name__)
 SYNC_MODE = os.getenv("SYNC_MODE", "false").lower() == "true"
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
+# Umbral simple de "confianza" implícita: si el modelo no llama NINGUNA tool,
+# tratamos el mensaje como sin_clasificar (reemplaza tu antiguo campo `confianza`)
+INTENCION_FALLBACK = "sin_clasificar"
+
 
 # ============================================
-# TAREAS PÚBLICAS (FastAPI)
+# TAREAS PÚBLICAS (FastAPI) — sin cambios
 # ============================================
 
 async def classify_user_preference_task(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Encola clasificación en Redis (cola high) o ejecuta directo en modo sync"""
     if SYNC_MODE:
         return job_classify_user_preference(data)
 
@@ -50,7 +52,6 @@ async def classify_user_preference_task(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def general_chat_task(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Chat: siempre síncrono (respuesta inmediata esperada)"""
     from .agent import agent
 
     response = agent.general_chat(
@@ -65,8 +66,8 @@ async def general_chat_task(data: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================
 
 def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Procesa el mensaje de GHL: resuelve entidades, clasifica intención y
-    despacha al manejador correspondiente en intenciones/."""
+    """Procesa el mensaje de GHL: resuelve entidades, decide la herramienta
+    (tool calling) y despacha al manejador correspondiente en intenciones/."""
 
     try:
         # ============================================
@@ -87,7 +88,7 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("=" * 60)
 
         # ============================================
-        # 2. ESTADO EN REDIS
+        # 2. ESTADO EN REDIS — sin cambios
         # ============================================
         state_manager = AgentStateManager()
 
@@ -117,7 +118,7 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 }
 
         # ============================================
-        # 2.5 HISTORIAL DE CONVERSACIÓN (preparado por el agente)
+        # 2.5 HISTORIAL DE CONVERSACIÓN — sin cambios
         # ============================================
         historial_texto = task_data.get('historial_texto', '')
 
@@ -127,7 +128,9 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             logger.info(f"📋 Historial recibido: {len(historial_texto)} caracteres")
 
         # ============================================
-        # 3. RESOLVER ENTIDADES DEL MENSAJE
+        # 3. RESOLVER ENTIDADES DEL MENSAJE — sin cambios
+        #    (esto sigue siendo tu fuente de verdad para sinónimos/jerga,
+        #    el LLM NO vuelve a extraer estos valores, se los pasamos ya resueltos)
         # ============================================
         resolver = EntityResolver()
         resolution = resolver.resolve_entities(message, contact_id)
@@ -140,72 +143,67 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             logger.info("🔍 Entidades resueltas: Ninguna")
 
         # ============================================
-        # 4. CLASIFICAR INTENCIÓN CON LLM
+        # 4. DECIDIR HERRAMIENTA CON TOOL CALLING
+        #    (reemplaza al antiguo prompt_intent_classifier + JSON de intención)
         # ============================================
-        intent_classifier = IntentClassifier()
         catalog_cache = CatalogCache()
-
-        intenciones_disponibles = catalog_cache.get_intenciones()
-        intenciones_texto = "\n".join(
-            f"- {i['nombre']}: {i['descripcion']}" for i in intenciones_disponibles
-        )
-
-        contexto_estado = ""
-        if state.get('producto'):
-            contexto_estado += f"Producto mencionado anteriormente: {state['producto']}\n"
-        if state.get('modelo'):
-            contexto_estado += f"Modelo mencionado anteriormente: {state['modelo']}\n"
-        if state.get('ultima_intencion'):
-            contexto_estado += f"Última intención: {state['ultima_intencion']}\n"
-        if state.get('entidades_no_resueltas'):
-            contexto_estado += f"Entidades pendientes: {state['entidades_no_resueltas']}\n"
-        if not contexto_estado:
-            contexto_estado = "No hay contexto previo."
-
-        # NOTA: historial_texto ya viene armado desde GHL (paso 2.5), no desde
-        # state['ultimos_turnos'] como antes.
+        herramientas = catalog_cache.get_herramientas()  # ver nota abajo
 
         client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
 
-        intent_prompt = load_prompt(
-            "prompt_intent_classifier",
+        system_prompt = load_prompt(
+            "prompt_seleccion_herramienta",
+            nombre_cliente=first_name,
+            producto=state.get('producto', 'no especificado'),
+            modelo=state.get('modelo', 'no especificado'),
+            intencion=state.get('ultima_intencion', 'ninguna'),
             historial_texto=historial_texto,
-            contexto_estado=contexto_estado,
-            message=message,
-            intenciones_texto=intenciones_texto,
         )
 
-        logger.info("=" * 60)
-        logger.info("📝 PROMPT COMPLETO PARA CLASIFICACIÓN DE INTENCIÓN:")
-        logger.info("-" * 40)
-        logger.info(intent_prompt)
-        logger.info("=" * 60)
-
-        intent_response = client.chat.completions.create(
+        tool_response = client.chat.completions.create(
             model="openai/gpt-4o-mini",
-            messages=[{"role": "user", "content": intent_prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message},
+            ],
+            tools=herramientas,
+            tool_choice="required",  # antes "auto": obliga a elegir siempre una
+            # tool, incluida sin_clasificar. Con "auto" el modelo podía no
+            # llamar ninguna, y "no tool call" quedaba como default implícito
+            # compitiendo de forma no determinística con la lógica de 3
+            # reintentos de compra.py (ver casos "chirulai"/"chuflin"/"chinchulin").
             temperature=0.1,
-            max_tokens=150,
-            response_format={"type": "json_object"},
         )
 
-        resultado = json.loads(intent_response.choices[0].message.content)
+        msg = tool_response.choices[0].message
+        tool_calls = msg.tool_calls or []
 
-        intencion = resultado.get('intencion', 'sin_clasificar')
-        confianza = resultado.get('confianza', 0.0)
-        entidades_detectadas = resultado.get('entidades_detectadas', {})
-        razon = resultado.get('razon', '')
+        if tool_calls:
+            # Nota: si tu negocio necesita procesar varias tools en un mismo
+            # mensaje (ej: "tienes la pipa del GN125 y a qué hora abren"),
+            # acá es donde se itera tool_calls en vez de tomar solo la primera.
+            primera = tool_calls[0]
+            intencion = primera.function.name
+            try:
+                entidades_detectadas = json.loads(primera.function.arguments)
+            except json.JSONDecodeError:
+                entidades_detectadas = {}
+            razon = f"Tool seleccionada por el modelo: {intencion}"
+        else:
+            intencion = INTENCION_FALLBACK
+            entidades_detectadas = {}
+            razon = "El modelo no seleccionó ninguna herramienta"
 
-        logger.info(f"🎯 Intención clasificada: {intencion} (confianza: {confianza:.2f})")
+        logger.info(f"🎯 Herramienta seleccionada: {intencion}")
+        logger.info(f"   Entidades: {entidades_detectadas}")
         logger.info(f"   Razón: {razon}")
 
         # ============================================
-        # 4.5 PERSISTENCIA DE INTENCIÓN
+        # 4.5 PERSISTENCIA DE INTENCIÓN — sin cambios
         # ============================================
-
         intencion_anterior = state.get('ultima_intencion')
 
         if intencion_anterior and intencion_anterior != intencion:
@@ -215,9 +213,10 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             logger.info(f"📦 Contexto mantenido: producto='{state.get('producto')}', modelo='{state.get('modelo')}'")
 
         # ============================================
-        # 5. DESPACHO AL MANEJADOR DE LA INTENCIÓN
+        # 5. DESPACHO AL MANEJADOR — SIN CAMBIOS
+        #    (obtener_manejador ya usaba el nombre de intención como key,
+        #    que ahora es literalmente el mismo string que `tool_call.name`)
         # ============================================
-
         ctx = IntentContext(
             message=message,
             contact_id=contact_id,
@@ -225,7 +224,7 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             first_name=first_name,
             last_name=last_name,
             intencion=intencion,
-            confianza=confianza,
+            confianza=1.0 if tool_calls else 0.0,  # ya no viene del LLM, se infiere
             entidades_detectadas=entidades_detectadas,
             razon=razon,
             state=state,
@@ -241,13 +240,11 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             resultado_manejador = manejador(ctx)
             if resultado_manejador is not None:
                 return resultado_manejador
-            # El manejador devolvió None → prefiere delegar en el LLM genérico
-            # (p. ej. compra.py cuando la consulta al catálogo falla)
         else:
             logger.info(f"ℹ️ Intención '{intencion}' no tiene rama específica, usando LLM genérico")
 
         # ============================================
-        # 6. LLM GENÉRICO (fallback o intenciones sin rama propia)
+        # 6. LLM GENÉRICO — sin cambios
         # ============================================
         resultado_final = generico.handle(ctx)
 
@@ -275,10 +272,6 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def enqueue_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Encola un mensaje de GHL en la cola QUEUE_AI
-    Usado por quinchau_agent (FastAPI)
-    """
     queue = get_queue(QUEUE_AI)
 
     job = queue.enqueue(
@@ -296,10 +289,6 @@ def enqueue_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
         "message": f"Job encolado en cola AI",
     }
 
-
-# ============================================
-# DICCIONARIO DE TAREAS
-# ============================================
 
 TASKS = {
     "classify_user_preference": classify_user_preference_task,

@@ -11,6 +11,36 @@ CACHE_TTL = 300  # 5 minutos
 KEY_INTENCIONES = "catalog:intenciones"
 KEY_BLOQUEANTES = "catalog:bloqueantes"
 KEY_TERMINOS_PATTERNS = "catalog:terminos_patterns"
+KEY_HERRAMIENTAS = "catalog:herramientas"
+
+# JSON Schema no tiene tipos nativos de fecha/hora: se mapean a string + format
+TIPO_MAP = {
+    "string": "string",
+    "integer": "integer",
+    "decimal": "number",
+    "boolean": "boolean",
+    "date": "string",
+    "time": "string",
+}
+FORMATO_EXTRA = {
+    "date": {"format": "date"},
+    "time": {"format": "time"},
+}
+
+# sin_clasificar SE INCLUYE como tool explícita (no se excluye).
+# Motivo: con tool_choice="required" el modelo siempre debe elegir algo, y
+# necesitamos que "no reconozco esto" sea una elección afirmativa y
+# reproducible, no lo que pasa por default cuando el modelo no llama
+# ninguna tool. Ver discusión: casos "chirulai"/"chuflin"/"chinchulin"
+# donde el mismo tipo de mensaje daba resultados distintos entre sí.
+EXCLUIR_DE_HERRAMIENTAS = set()
+
+DESCRIPCION_SIN_CLASIFICAR = (
+    "Usar cuando el mensaje del cliente menciona un producto o repuesto que "
+    "no se reconoce por nombre ni por sinónimo/jerga conocida, o cuando el "
+    "mensaje es genuinamente ambiguo y ninguna otra herramienta aplica. "
+    "Esto deriva la conversación a un agente humano."
+)
 
 
 class CatalogCache:
@@ -96,6 +126,111 @@ class CatalogCache:
         for row in rows:
             result.setdefault(row['intencion'], []).append(row['entidad'])
         return result
+
+    # ============================================
+    # HERRAMIENTAS (tools) PARA TOOL CALLING
+    #    intenciones + entidades + intencion_entidad -> JSON schema
+    # ============================================
+
+    def get_herramientas(self):
+        """Lista de tools en formato OpenAI function-calling, generadas desde
+        las mismas tablas que ya usás para intenciones/entidades bloqueantes.
+        [{'type': 'function', 'function': {'name':..., 'description':..., 'parameters': {...}}}, ...]
+        """
+        try:
+            cached = self.redis.get(KEY_HERRAMIENTAS)
+            if cached:
+                return json.loads(cached)
+        except Exception as e:
+            logger.warning(f"⚠️ Redis no disponible (get herramientas), usando BD directo: {e}")
+            return self._load_herramientas_from_db()
+
+        data = self._load_herramientas_from_db()
+        try:
+            self.redis.setex(KEY_HERRAMIENTAS, CACHE_TTL, json.dumps(data, default=str))
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo escribir cache de herramientas: {e}")
+        return data
+
+    def _load_herramientas_from_db(self):
+        query_intenciones = """
+        SELECT id, nombre, descripcion
+        FROM intenciones
+        WHERE activo = 1
+        ORDER BY id
+        """
+        query_relaciones = """
+        SELECT
+            ie.id_intencion,
+            e.nombre as entidad_nombre,
+            e.descripcion as entidad_descripcion,
+            e.tipo as entidad_tipo,
+            ie.bloqueante,
+            ie.orden_prioridad
+        FROM intencion_entidad ie
+        JOIN entidades e ON ie.id_entidad = e.id
+        JOIN intenciones i ON ie.id_intencion = i.id
+        WHERE i.activo = 1
+        ORDER BY ie.id_intencion, ie.orden_prioridad
+        """
+
+        try:
+            with self.db.cursor() as cursor:
+                cursor.execute(query_intenciones)
+                intenciones = cursor.fetchall()
+        except Exception as e:
+            logger.error(f"❌ Error consultando intenciones (herramientas): {e}")
+            return []
+
+        try:
+            with self.db.cursor() as cursor:
+                cursor.execute(query_relaciones)
+                relaciones = cursor.fetchall()
+        except Exception as e:
+            logger.error(f"❌ Error consultando intencion_entidad (herramientas): {e}")
+            relaciones = []
+
+        rel_por_intencion = {}
+        for row in relaciones:
+            rel_por_intencion.setdefault(row['id_intencion'], []).append(row)
+
+        herramientas = []
+        for intencion in intenciones:
+            if intencion['nombre'] in EXCLUIR_DE_HERRAMIENTAS:
+                continue
+
+            properties = {}
+            required = []
+            for rel in rel_por_intencion.get(intencion['id'], []):
+                tipo_sql = rel['entidad_tipo']
+                prop = {
+                    "type": TIPO_MAP.get(tipo_sql, "string"),
+                    "description": rel['entidad_descripcion'] or rel['entidad_nombre'],
+                }
+                prop.update(FORMATO_EXTRA.get(tipo_sql, {}))
+                properties[rel['entidad_nombre']] = prop
+                if rel['bloqueante']:
+                    required.append(rel['entidad_nombre'])
+
+            if intencion['nombre'] == 'sin_clasificar':
+                descripcion = DESCRIPCION_SIN_CLASIFICAR
+            else:
+                descripcion = intencion['descripcion'] or intencion['nombre']
+
+            herramientas.append({
+                "type": "function",
+                "function": {
+                    "name": intencion['nombre'],
+                    "description": descripcion,
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                    },
+                },
+            })
+
+        return herramientas
 
     # ============================================
     # TÉRMINOS + ALIAS (merge + dedup + sort ya resuelto)
@@ -195,3 +330,8 @@ class CatalogCache:
 # de términos/alias deberán llamar a algo como:
 #   CatalogCache().redis.delete(KEY_TERMINOS_PATTERNS)
 # justo después de un UPDATE/INSERT exitoso en terminos_semanticos o terminos_alias.
+#
+# Lo mismo aplica para KEY_HERRAMIENTAS: si editás intenciones, entidades o
+# intencion_entidad desde el panel de administración, hay que invalidar
+# también catalog:herramientas (y catalog:intenciones / catalog:bloqueantes,
+# que quedan redundantes una vez migrado el dispatcher a tool calling).

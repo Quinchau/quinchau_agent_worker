@@ -85,6 +85,11 @@ def _manejar_entidades_faltantes(ctx: IntentContext, faltantes: List[str], inten
         ultima_pregunta=ultima_pregunta,
     )
 
+    logger.info("📝 PROMPT ENVIADO A OPENAI (Entidades Faltantes):")
+    logger.info("-" * 50)
+    logger.info(prompt_pregunta)
+    logger.info("-" * 50)
+
     pregunta = ctx.client.chat.completions.create(
         model="openai/gpt-4o-mini",
         messages=[{"role": "user", "content": prompt_pregunta}],
