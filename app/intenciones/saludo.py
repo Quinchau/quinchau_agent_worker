@@ -21,43 +21,25 @@ def handle(ctx: IntentContext) -> dict:
         historial_texto=ctx.historial_texto,
     )
 
-    llm_response = ctx.client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"El cliente {ctx.first_name} dice: \"{ctx.message}\""},
-        ],
-        temperature=0.3,
-        max_tokens=60,
-    )
-
-    respuesta = llm_response.choices[0].message.content.strip()
-
-    es_duplicado = "SALUDO_DUPLICADO" in respuesta or "{SALUDO_DUPLICADO}" in respuesta
-
-    if es_duplicado:
-        logger.info("🔄 Saludo duplicado ignorado (sin respuesta)")
-        logger.debug(f"   Respuesta LLM: {respuesta}")
-
-        ctx.state_manager.update_state(ctx.contact_id, {
-            'ultima_intencion': ctx.intencion,
-            'saludo_duplicado_ignorado': True,
-            'ultimo_saludo_ignorado': datetime.now().isoformat(),
-        })
-
-        return {
-            "success": True,
-            "ignored": True,
-            "contact_id": ctx.contact_id,
-            "intencion": ctx.intencion,
-            "reason": "saludo_duplicado",
-            "processed_at": datetime.now().isoformat(),
-        }
+    try:
+        llm_response = ctx.client.chat.completions.create(
+            model="openai/gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"El cliente {ctx.first_name} dice: \"{ctx.message}\""},
+            ],
+            temperature=0.3,
+            max_tokens=60,
+        )
+        respuesta = llm_response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"❌ Error generando saludo: {e}")
+        respuesta = f"¡Hola {ctx.first_name}! ¿En qué puedo ayudarte hoy?"
 
     logger.info(f"✅ Saludo enviado: {respuesta[:40]}...")
 
     send_message_to_ghl(ctx.contact_id, respuesta, ctx.channel)
-    ctx.state_manager.add_turno(ctx.contact_id, ctx.message, respuesta)
+    # ❌ ELIMINADA: ctx.state_manager.add_turno(ctx.contact_id, ctx.message, respuesta)
     ctx.state_manager.update_state(ctx.contact_id, {'ultima_intencion': ctx.intencion})
 
     return {

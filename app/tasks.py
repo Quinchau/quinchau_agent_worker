@@ -160,6 +160,16 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             historial_texto=historial_texto,
         )
 
+        # 🔥 LOG DEL PROMPT COMPLETO
+        logger.info("=" * 80)
+        logger.info("📝 PROMPT SELECCIÓN HERRAMIENTA (COMPLETO):")
+        logger.info("=" * 80)
+        logger.info(system_prompt)
+        logger.info("=" * 80)
+        logger.info(f"📝 MENSAJE USUARIO: {message}")
+        logger.info(f"📝 TOOLS DISPONIBLES: {[t['function']['name'] for t in herramientas]}")
+        logger.info("=" * 80)
+
         tool_response = client.chat.completions.create(
             model="openai/gpt-4o-mini",
             messages=[
@@ -219,16 +229,7 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             'ultima_intencion': intencion,
             'updated_at': datetime.now().isoformat()
         })
-        
-        # Si no se encontraron todas las entidades, incrementar contador de intentos
-        if resultado_resolucion['estado'] in ['parcial', 'no_encontrado']:
-            intentos_actuales = state.get('intentos_resolucion', 0) + 1
-            state_manager.update_state(contact_id, {
-                'intentos_resolucion': intentos_actuales
-            })
-            state = state_manager.get_state(contact_id)
-            logger.info(f"📊 Intentos de resolución: {intentos_actuales}")
-
+              
         # ============================================
         # 6. PERSISTENCIA DE INTENCIÓN
         # ============================================
@@ -306,7 +307,6 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                         'model_found': False,
                         'esperando_confirmacion': False,
                         'esperando_respuesta': False,
-                        'intentos_resolucion': 0,
                     })
                     
                     logger.info(f"✅ Respuesta generada y enviada para {intencion}")
@@ -332,7 +332,6 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                             'model_found': False,
                             'esperando_confirmacion': False,
                             'esperando_respuesta': False,
-                            'intentos_resolucion': 0,
                         })
                         return resultado_manejador
             
@@ -346,7 +345,6 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                     'model_found': False,
                     'esperando_confirmacion': False,
                     'esperando_respuesta': False,
-                    'intentos_resolucion': 0,
                 })
                 return resultado_manejador
         
@@ -364,7 +362,6 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             'model_found': False,
             'esperando_confirmacion': False,
             'esperando_respuesta': False,
-            'intentos_resolucion': 0,
         })
 
         logger.info("=" * 60)

@@ -14,11 +14,9 @@ PRODUCTOS ENCONTRADOS:
 INSTRUCCIONES:
 1. Analiza el contexto de la conversación.
 2. Elige el producto que MEJOR responda a la pregunta del cliente.
-3. ⚠️ PRIORIZA productos con STOCK DISPONIBLE (stock > 0).
-4. Si el cliente pidió algo específico (ej: "izquierdo", "derecho"), elige ese.
-5. Si hay múltiples opciones con stock, elige la que tenga mayor stock.
-6. Si ningún producto tiene stock, elige el más relevante.
-7. Responde con un JSON con el producto seleccionado.
+3. Si el cliente pidió algo específico (ej: "izquierdo", "derecho"), elige ese.
+4. Si varios productos coinciden con la peticion del cliente, entrega el de mayor stock disponible.
+5. Responde con un JSON con el producto seleccionado.
 
 RESPUESTA EN JSON:
 {{
