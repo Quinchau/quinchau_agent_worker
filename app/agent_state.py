@@ -30,11 +30,17 @@ class AgentStateManager:
             "productos_mencionados": [],
             "entidades_no_resueltas": [],
             "intentos_resolucion": 0,
-            "status_conversacion": "active",  # active | paused
+            "status_conversacion": "active",
             "id_usuario": contact_id,
             "nombre_cliente": contact_data.get("first_name", ""),
             "telefono_cliente": contact_data.get("phone", ""),
             "email_cliente": contact_data.get("email", ""),
+            # ============================================
+            # NUEVOS CAMPOS PARA FLAGS DE RESOLUCIÓN
+            # ============================================
+            "product_found": False,
+            "model_found": False,
+            "estado_resolucion": "no_encontrado",
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat()
         }
@@ -51,16 +57,43 @@ class AgentStateManager:
         return None
     
     def update_state(self, contact_id, updates):
+        """
+        Actualiza el estado del usuario en Redis.
+        
+        AHORA: Permite agregar NUEVAS claves que no existían en el estado inicial.
+        """
         state_key = self.get_state_key(contact_id)
         current = self.get_state(contact_id)
         if not current:
             return None
         
+        # Actualizar todas las claves, incluyendo las nuevas
         for key, value in updates.items():
-            if key in current:
-                current[key] = value
+            current[key] = value  # ← AHORA permite claves nuevas
         
         current["updated_at"] = datetime.now().isoformat()
         self.redis.setex(state_key, 86400, json.dumps(current, default=str))
         return current
     
+    def reset_resolution_flags(self, contact_id):
+        """Resetea los flags de resolución después de procesar."""
+        return self.update_state(contact_id, {
+            "product_found": False,
+            "model_found": False,
+            "estado_resolucion": "no_encontrado",
+            "entidades_no_resueltas": [],
+            "intentos_resolucion": 0
+        })
+    
+    def set_resolved(self, contact_id, producto, modelo):
+        """Marca el estado como resuelto."""
+        return self.update_state(contact_id, {
+            "producto": producto,
+            "modelo": modelo,
+            "ultimo_modelo": modelo,
+            "product_found": True,
+            "model_found": True,
+            "estado_resolucion": "resuelto",
+            "entidades_no_resueltas": [],
+            "intentos_resolucion": 0
+        })

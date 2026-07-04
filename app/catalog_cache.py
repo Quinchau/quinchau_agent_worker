@@ -35,14 +35,6 @@ FORMATO_EXTRA = {
 # donde el mismo tipo de mensaje daba resultados distintos entre sí.
 EXCLUIR_DE_HERRAMIENTAS = set()
 
-DESCRIPCION_SIN_CLASIFICAR = (
-    "Usar cuando el mensaje del cliente menciona un producto o repuesto que "
-    "no se reconoce por nombre ni por sinónimo/jerga conocida, o cuando el "
-    "mensaje es genuinamente ambiguo y ninguna otra herramienta aplica. "
-    "Esto deriva la conversación a un agente humano."
-)
-
-
 class CatalogCache:
     def __init__(self):
         self.redis = get_redis()
@@ -212,10 +204,7 @@ class CatalogCache:
                 if rel['bloqueante']:
                     required.append(rel['entidad_nombre'])
 
-            if intencion['nombre'] == 'sin_clasificar':
-                descripcion = DESCRIPCION_SIN_CLASIFICAR
-            else:
-                descripcion = intencion['descripcion'] or intencion['nombre']
+            descripcion = intencion['descripcion'] or intencion['nombre']
 
             herramientas.append({
                 "type": "function",
