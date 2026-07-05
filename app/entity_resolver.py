@@ -26,20 +26,10 @@ class EntityResolver:
         text = ''.join([c for c in text if not unicodedata.combining(c)])
         return text
 
-    # ============================================
-    # NUEVO FLUJO: BÚSQUEDA SEMÁNTICA (SOLO UN MATCH)
-    # ============================================
-
     def buscar_termino(self, texto: str, tipo_entidad: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Busca el MEJOR match en el catálogo.
-        
-        RETORNA:
-        - Dict con el mejor match (termino, entidad_nombre, id_entidad)
-        - None si no encuentra nada
-        
-        NO retorna listas, NO retorna scores, NO retorna ambigüedad.
-        Solo importa si existe o no existe el término.
+        Retorna Dict con el mejor match o None si no encuentra nada.
         """
         if not texto:
             return None
@@ -51,13 +41,10 @@ class EntityResolver:
         best_priority = 0
         
         for item in all_patterns:
-            # Filtrar por tipo de entidad si se especifica
             if tipo_entidad and item['entidad_nombre'] != tipo_entidad:
                 continue
             
-            # Verificar si hay coincidencia
             if self._text_matches(normalized, item['pattern']):
-                # Calcular prioridad para elegir el mejor
                 priority = self._calculate_priority(normalized, item['pattern'])
                 
                 if priority > best_priority:
@@ -71,11 +58,9 @@ class EntityResolver:
                     }
         
         if best_match:
-            logger.info(f"🔍 Búsqueda: '{texto}' → '{best_match['termino']}'")
-            return best_match
+            logger.debug(f"🔍 Búsqueda: '{texto}' → '{best_match['termino']}' ({best_match['entidad_nombre']})")
         
-        logger.info(f"🔍 Búsqueda: '{texto}' → Sin resultados")
-        return None
+        return best_match
 
     def buscar_producto(self, texto: str) -> Optional[Dict[str, Any]]:
         """Helper: busca solo productos."""
@@ -88,38 +73,32 @@ class EntityResolver:
     def _text_matches(self, query: str, term: str) -> bool:
         """
         Verifica si query coincide con término del catálogo.
-        
         SOLO matchea términos completos, NO subcadenas parciales.
-        Ej: "bujia" NO debe matchear "bobina bujia"
         """
         if not query or not term:
             return False
         
-        query = query.lower().strip()
-        term = term.lower().strip()
+        query_normalized = self.normalize_text(query)
+        term_normalized = self.normalize_text(term)
         
-        # Exact match (mejor caso)
-        if query == term:
+        # Exact match
+        if query_normalized == term_normalized:
             return True
         
-        query_words = query.split()
-        term_words = term.split()
+        query_words = query_normalized.split()
+        term_words = term_normalized.split()
         
         # Query contiene el término como palabra completa
-        # Ej: "bujia iridium" contiene "bujia"
-        if len(query_words) > 1 and term in query_words:
+        if len(query_words) > 1 and term_normalized in query_words:
             return True
         
         # Término contiene la query como palabra completa
-        # Ej: "bujia" está en "bujia iridium"
-        if len(term_words) > 1 and query in term_words:
+        if len(term_words) > 1 and query_normalized in term_words:
             return True
         
         # Todas las palabras de query están en term
-        # Ej: "freno delantero" y "freno_delantero"
-        if query_words:
-            if all(word in term_words for word in query_words):
-                return True
+        if query_words and all(word in term_words for word in query_words):
+            return True
         
         return False
 
@@ -127,23 +106,22 @@ class EntityResolver:
         """
         Calcula prioridad para elegir el mejor match.
         Prioridad más alta = mejor match.
-        
-        SOLO se usa internamente para elegir entre múltiples matches.
         """
-        query = query.lower().strip()
-        term = term.lower().strip()
+        query = self.normalize_text(query)
+        term = self.normalize_text(term)
+        
+        if not query or not term:
+            return 0
         
         # Exact match = mayor prioridad
         if query == term:
             return 100
         
-        # Query es más específica (contiene el término)
-        # Ej: "bujia iridium" contiene "bujia"
+        # Query contiene el término
         if query in term:
             return 80
         
         # Término contiene la query
-        # Ej: "bujia" está en "bujia iridium"
         if term in query:
             return 70
         
@@ -153,7 +131,6 @@ class EntityResolver:
         common = query_words.intersection(term_words)
         
         if common:
-            # Todas las palabras de query están en term
             if len(common) == len(query_words):
                 return 50 + len(common) * 10
             return 30 + len(common) * 10
@@ -161,154 +138,106 @@ class EntityResolver:
         return 0
 
     def resolver_con_entidades_llm(self, 
-                                        contact_id: str, 
-                                        entidades_llm: Dict[str, Any]) -> Dict[str, Any]:
-            """
-            El worker resuelve entidades usando el catálogo como fuente de verdad.
-            IMPONE el tipo real de cada entidad basado en el catálogo.
-            """
-            if not contact_id or not entidades_llm:
-                return {
-                    'resolved': {},
-                    'product_found': False,
-                    'model_found': False,
-                    'estado': 'no_encontrado',
-                    'entidades_no_resueltas': ['producto', 'modelo'],
-                    'contact_id': contact_id
-                }
-            
-            resolved = {}
-            product_found = False
-            model_found = False
-            
-            # ============================================
-            # PROCESAR TODAS LAS ENTIDADES DEL LLM
-            # EL WORKER IMPONE EL TIPO REAL DEL CATÁLOGO
-            # ============================================
-            
-            entidades_a_procesar = []
-            
-            if entidades_llm.get('producto'):
-                entidades_a_procesar.append(('producto', entidades_llm['producto']))
-            
-            if entidades_llm.get('modelo'):
-                entidades_a_procesar.append(('modelo', entidades_llm['modelo']))
-            
-            # Procesar cada entidad con búsqueda GENERAL
-            for tipo_llm, texto in entidades_a_procesar:
-                if not texto:
-                    continue
-                    
-                # 🔍 BÚSQUEDA GENERAL - El worker IMPONE lo que es
-                match = self.buscar_termino(texto)  # Sin filtro de tipo
-                
-                if match:
-                    tipo_real = match['entidad_nombre']  # El catálogo dice qué es
-                    termino_encontrado = match['termino']
-                    
-                    # ============================================
-                    # EL WORKER IMPONE EL TIPO REAL DEL CATÁLOGO
-                    # ============================================
-                    if tipo_real == 'producto':
-                        # El catálogo dice que es PRODUCTO
-                        resolved['producto'] = termino_encontrado
-                        product_found = True
-                        
-                        # Si el LLM dijo modelo, lo corregimos
-                        if tipo_llm == 'modelo':
-                            logger.info(f"🚨 EL WORKER CORRIGE AL LLM: '{texto}' es PRODUCTO (LLM dijo modelo)")
-                        else:
-                            logger.info(f"✅ Producto confirmado: '{termino_encontrado}'")
-                            
-                    elif tipo_real == 'modelo':
-                        # El catálogo dice que es MODELO
-                        resolved['modelo'] = termino_encontrado
-                        resolved['ultimo_modelo'] = termino_encontrado
-                        model_found = True
-                        
-                        # Si el LLM dijo producto, lo corregimos
-                        if tipo_llm == 'producto':
-                            logger.info(f"🚨 EL WORKER CORRIGE AL LLM: '{texto}' es MODELO (LLM dijo producto)")
-                        else:
-                            logger.info(f"✅ Modelo confirmado: '{termino_encontrado}'")
-                else:
-                    logger.info(f"❌ Término no encontrado en catálogo: '{texto}' (LLM dijo {tipo_llm})")
-            
-            # ============================================
-            # DETERMINAR ESTADO - EL WORKER SETEA EL STATE
-            # ============================================
-            
-            if product_found and model_found:
-                estado = 'resuelto'
-            elif product_found or model_found:
-                estado = 'parcial'
-            else:
-                estado = 'no_encontrado'
-            
-            entidades_no_resueltas = []
-            if not product_found:
-                entidades_no_resueltas.append('producto')
-            if not model_found:
-                entidades_no_resueltas.append('modelo')
-            
-            # ============================================
-            # EL WORKER SETEA EL STATE - FUENTE DE VERDAD
-            # ============================================
-            updates = {}
-            
-            # ⭐ Producto: El worker decide
-            if product_found:
-                updates['producto'] = resolved.get('producto')
-                updates['product_found'] = True
-            else:
-                # Si el LLM dijo producto pero no existe en catálogo, NO se setea
-                updates['producto'] = None
-                updates['product_found'] = False
-            
-            # ⭐ Modelo: El worker decide
-            if model_found:
-                updates['modelo'] = resolved.get('modelo')
-                updates['ultimo_modelo'] = resolved.get('modelo')
-                updates['model_found'] = True
-            else:
-                # Si el LLM dijo modelo pero no existe en catálogo, NO se setea
-                updates['modelo'] = None
-                updates['model_found'] = False
-            
-            updates['estado_resolucion'] = estado
-            updates['entidades_no_resueltas'] = entidades_no_resueltas
-            updates['updated_at'] = datetime.now().isoformat()
-            
-            logger.info(f"📦 EL WORKER SETEA EL STATE:")
-            logger.info(f"   producto: {updates.get('producto')} (found={product_found})")
-            logger.info(f"   modelo: {updates.get('modelo')} (found={model_found})")
-            logger.info(f"   estado: {estado}")
-            logger.info(f"   entidades_no_resueltas: {entidades_no_resueltas}")
-            
-            try:
-                self.state_manager.update_state(contact_id, updates)
-            except Exception as e:
-                logger.error(f"❌ Error actualizando estado en Redis: {e}")
-            
+                                    contact_id: str, 
+                                    entidades_llm: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        El worker resuelve entidades usando el catálogo como fuente de verdad.
+        IMPONE el tipo real de cada entidad basado en el catálogo.
+        """
+        if not contact_id or not entidades_llm:
             return {
-                'resolved': resolved,
-                'product_found': product_found,
-                'model_found': model_found,
-                'estado': estado,
-                'entidades_no_resueltas': entidades_no_resueltas,
+                'resolved': {},
+                'product_found': False,
+                'model_found': False,
+                'estado': 'no_encontrado',
+                'entidades_no_resueltas': ['producto', 'modelo'],
                 'contact_id': contact_id
             }
+        
+        resolved = {}
+        product_found = False
+        model_found = False
+        
+        entidades_a_procesar = []
+        
+        if entidades_llm.get('producto'):
+            entidades_a_procesar.append(('producto', entidades_llm['producto']))
+        
+        if entidades_llm.get('modelo'):
+            entidades_a_procesar.append(('modelo', entidades_llm['modelo']))
+        
+        for tipo_llm, texto in entidades_a_procesar:
+            if not texto:
+                continue
+                
+            match = self.buscar_termino(texto)
+            
+            if match:
+                tipo_real = match['entidad_nombre']
+                termino_encontrado = match['termino']
+                
+                if tipo_real == 'producto':
+                    resolved['producto'] = termino_encontrado
+                    product_found = True
+                    logger.info(f"✅ Producto confirmado: '{termino_encontrado}'")
+                    
+                elif tipo_real == 'modelo':
+                    resolved['modelo'] = termino_encontrado
+                    resolved['ultimo_modelo'] = termino_encontrado
+                    model_found = True
+                    logger.info(f"✅ Modelo confirmado: '{termino_encontrado}'")
+            else:
+                logger.info(f"❌ Término no encontrado: '{texto}'")
+        
+        if product_found and model_found:
+            estado = 'resuelto'
+        elif product_found or model_found:
+            estado = 'parcial'
+        else:
+            estado = 'no_encontrado'
+        
+        entidades_no_resueltas = []
+        if not product_found:
+            entidades_no_resueltas.append('producto')
+        if not model_found:
+            entidades_no_resueltas.append('modelo')
+        
+        updates = {
+            'producto': resolved.get('producto') if product_found else None,
+            'modelo': resolved.get('modelo') if model_found else None,
+            'product_found': product_found,
+            'model_found': model_found,
+            'estado_resolucion': estado,
+            'entidades_no_resueltas': entidades_no_resueltas,
+            'updated_at': datetime.now().isoformat()
+        }
+        
+        if model_found and resolved.get('modelo'):
+            updates['ultimo_modelo'] = resolved.get('modelo')
+        
+        logger.info(f"📦 Resolución: producto={updates.get('producto')}, modelo={updates.get('modelo')}, estado={estado}")
+        
+        try:
+            self.state_manager.update_state(contact_id, updates)
+        except Exception as e:
+            logger.error(f"❌ Error actualizando estado: {e}")
+        
+        return {
+            'resolved': resolved,
+            'product_found': product_found,
+            'model_found': model_found,
+            'estado': estado,
+            'entidades_no_resueltas': entidades_no_resueltas,
+            'contact_id': contact_id
+        }
 
     # ============================================
-    # MÉTODOS LEGACY (DEPRECADOS - PARA COMPATIBILIDAD)
+    # MÉTODOS LEGACY (DEPRECADOS)
     # ============================================
 
     def extract_entities(self, message: str) -> List[Dict[str, Any]]:
         """
         ⚠️ DEPRECADO: Extrae entidades del mensaje.
-        
-        Este método se mantiene por compatibilidad con el flujo antiguo.
-        En el nuevo flujo, usar buscar_termino() en su lugar.
         """
         if not message:
             return []
@@ -344,18 +273,16 @@ class EntityResolver:
                     'entidad_nombre': item['entidad_nombre'],
                     'alias': pattern
                 })
-                logger.debug(f"✅ Match: '{pattern}' → término '{termino}'")
                 break
 
-        logger.info(f"🔍 Encontrados {len(matches)} matches en mensaje")
+        if matches:
+            logger.debug(f"🔍 Encontrados {len(matches)} matches en mensaje")
+        
         return matches
 
     def resolve_entities(self, message: str, contact_id: str) -> Dict[str, Any]:
         """
         ⚠️ DEPRECADO: Resuelve entidades y actualiza estado.
-        
-        Este método se mantiene por compatibilidad con el flujo antiguo.
-        En el nuevo flujo, usar resolver_con_entidades_llm() en su lugar.
         """
         if not message or not contact_id:
             logger.warning("⚠️ message o contact_id vacío")
@@ -379,19 +306,15 @@ class EntityResolver:
                 resolved['modelo'] = termino
                 resolved['ultimo_modelo'] = termino
                 tiene_modelo = True
-                logger.info(f"✅ Modelo detectado: {termino}")
                 
             elif entidad == 'producto':
                 resolved['producto'] = termino
                 tiene_producto = True
-                logger.info(f"✅ Producto detectado: {termino}")
                 
             elif entidad == 'no_clasificado':
                 if termino not in no_resueltas:
                     no_resueltas.append(termino)
-                    logger.warning(f"⚠️ Sin clasificar: {termino}")
 
-        state = self.state_manager.get_state(contact_id) or {}
         updates = {}
 
         if tiene_producto:
@@ -405,7 +328,6 @@ class EntityResolver:
         
         if no_resueltas:
             updates['entidades_no_resueltas'] = no_resueltas
-            logger.info(f"📝 Términos no resueltos: {no_resueltas}")
         else:
             updates['entidades_no_resueltas'] = []
         
@@ -414,11 +336,8 @@ class EntityResolver:
         if updates:
             try:
                 self.state_manager.update_state(contact_id, updates)
-                logger.info(f"📦 Estado actualizado: {list(updates.keys())}")
-                estado_nuevo = self.state_manager.get_state(contact_id)
-                logger.info(f"📦 Nuevo estado: producto='{estado_nuevo.get('producto')}', modelo='{estado_nuevo.get('modelo')}'")
             except Exception as e:
-                logger.error(f"❌ Error actualizando estado en Redis: {e}")
+                logger.error(f"❌ Error actualizando estado: {e}")
         
         return {
             'resolved': resolved,

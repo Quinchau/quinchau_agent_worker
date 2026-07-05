@@ -12,11 +12,7 @@ PRODUCTOS ENCONTRADOS:
 {productos_texto}
 
 INSTRUCCIONES:
-1. Analiza el contexto de la conversación.
-2. Elige el producto que MEJOR responda a la pregunta del cliente.
-3. Si el cliente pidió algo específico (ej: "izquierdo", "derecho"), elige ese.
-4. Si varios productos coinciden con la peticion del cliente, entrega el de mayor stock disponible.
-5. Responde con un JSON con el producto seleccionado.
+1. Busca en la lista de productos encontrados la opcion que mas coincidencia tenga con la peticion del cliente
 
 RESPUESTA EN JSON:
 {{

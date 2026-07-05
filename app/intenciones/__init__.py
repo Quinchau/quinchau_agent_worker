@@ -16,7 +16,7 @@ No hace falta tocar tasks.py.
 from .context import IntentContext, obtener_manejador, registrar, intenciones_registradas  # noqa: F401
 
 from . import sin_clasificar  # noqa: F401,E402
-from . import cotizar_envio  # noqa: F401,E402
+from . import envios_y_entregas  # noqa: F401,E402
 from . import retiro_y_pago_personal  # noqa: F401,E402
 from . import envio_por_delivery  # noqa: F401,E402
 from . import saludo  # noqa: F401,E402

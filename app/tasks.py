@@ -14,6 +14,8 @@ from .catalog_cache import CatalogCache
 from .prompts import load_prompt
 from .intenciones import IntentContext, obtener_manejador
 from .intenciones import generico
+from .aclaracion_gate import es_aclaracion_de_busqueda
+from .intenciones.catalogo import resolver_y_responder_catalogo
 
 # ============================================
 # CONFIGURACIÓN
@@ -109,29 +111,138 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
 
             # Verificar si conversación está en pausa
             if state.get('status_conversacion') == 'paused':
-                logger.info(f"⏸️ Conversación en pausa para {contact_id}. Mensaje ignorado.")
-                return {
-                    "success": True,
-                    "ignored": True,
-                    "contact_id": contact_id,
-                    "status": "paused",
-                    "reason": "conversation_paused",
-                    "processed_at": datetime.now().isoformat(),
-                }
+                pausa_hasta = state.get('pausa_hasta')
+                pausa_vencida = False
+
+                if pausa_hasta:
+                    try:
+                        pausa_vencida = datetime.fromisoformat(pausa_hasta) <= datetime.now()
+                    except ValueError:
+                        logger.warning(f"⚠️ 'pausa_hasta' inválido para {contact_id}: {pausa_hasta!r}")
+                        pausa_vencida = True
+                else:
+                    # Pausa sin timestamp (registro antiguo) → no bloqueamos indefinidamente
+                    pausa_vencida = True
+
+                if pausa_vencida:
+                    logger.info(f"▶️ Pausa vencida para {contact_id}, reanudando conversación")
+                    state_manager.update_state(contact_id, {
+                        'status_conversacion': 'active',
+                        'pausa_hasta': None,
+                    })
+                    state = state_manager.get_state(contact_id)
+                    # No hacemos return: el mensaje sigue el flujo normal más abajo
+                else:
+                    logger.info(f"⏸️ Conversación en pausa para {contact_id}. Mensaje ignorado.")
+                    return {
+                        "success": True,
+                        "ignored": True,
+                        "contact_id": contact_id,
+                        "status": "paused",
+                        "reason": "conversation_paused",
+                        "processed_at": datetime.now().isoformat(),
+                    }
 
             # Verificar si estamos en flujo de discernimiento
             if state.get('esperando_confirmacion') or state.get('esperando_respuesta'):
                 logger.info(f"🔄 Continuando flujo de discernimiento para {contact_id}")
 
         # ============================================
-        # 2.5 HISTORIAL DE CONVERSACIÓN
+        # 2.5 PUERTA DE CATÁLOGO (DETECCIÓN Y ACTUALIZACIÓN DE ESTADO)
+        # Detecta si el cliente sigue en el mismo contexto o cambió de tema.
+        # Busca CUALQUIER entidad del catálogo (producto, modelo, color, etc.),
+        # no solo producto/modelo.
+        # 
+        # ✅ AHORA: Guarda las entidades detectadas en el estado
         # ============================================
         historial_texto = task_data.get('historial_texto', '')
-
         if not historial_texto:
             logger.warning("⚠️ No hay historial_texto en task_data, usando vacío")
         else:
             logger.info(f"📋 Historial recibido: {len(historial_texto)} caracteres")
+
+        logger.info("🔍 [Puerta 2.5] Verificando contexto vs catálogo...")
+        resolver = EntityResolver()
+
+        entidades_en_mensaje = resolver.extract_entities(message)
+
+        cambio_de_contexto = False
+        entidad_conflicto = None
+
+        # ============================================
+        # ✅ NUEVO: Guardar entidades detectadas
+        # ============================================
+        entidades_a_guardar = {}
+
+        for ent in entidades_en_mensaje:
+            entidad_nombre = ent['entidad_nombre']
+            termino_detectado = ent['termino']
+            valor_en_state = state.get(entidad_nombre)
+            
+            # Guardar la entidad para actualizar el estado
+            entidades_a_guardar[entidad_nombre] = termino_detectado
+
+            if valor_en_state and str(valor_en_state).lower() != str(termino_detectado).lower():
+                cambio_de_contexto = True
+                entidad_conflicto = entidad_nombre
+                logger.info(
+                    f"🔄 [Puerta 2.5] Cambio de contexto en '{entidad_nombre}': "
+                    f"'{valor_en_state}' → '{termino_detectado}'"
+                )
+            elif valor_en_state:
+                logger.info(f"✅ [Puerta 2.5] '{entidad_nombre}' idéntico: '{valor_en_state}'")
+            else:
+                logger.info(f"🆕 [Puerta 2.5] '{entidad_nombre}'='{termino_detectado}' no estaba en state")
+
+        # ============================================
+        # ✅ NUEVO: Actualizar estado con entidades detectadas
+        # ============================================
+        if entidades_a_guardar:
+            logger.info(f"💾 [Puerta 2.5] Guardando entidades en estado: {entidades_a_guardar}")
+            state_manager.update_state(contact_id, entidades_a_guardar)
+            # Recargar el estado actualizado
+            state = state_manager.get_state(contact_id)
+            logger.info(f"📦 [Puerta 2.5] Estado actualizado: producto='{state.get('producto')}', modelo='{state.get('modelo')}'")
+
+        if not entidades_en_mensaje:
+            logger.info("🤷 [Puerta 2.5] Sin entidades detectadas en el mensaje")
+
+        if cambio_de_contexto:
+            logger.info(f"⏭️ [Puerta 2.5] Resultado: CAMBIO DE CONTEXTO ('{entidad_conflicto}')")
+        else:
+            logger.info("➡️ [Puerta 2.5] Resultado: MISMO CONTEXTO (o sin entidades)")
+
+        # ============================================
+        # 2.6 GATE: ¿ES ACLARACIÓN DE LA ÚLTIMA BÚSQUEDA?
+        # Solo se evalúa si la Puerta 2.5 NO detectó cambio de contexto.
+        # Si el LLM confirma que sí, se reusa producto+modelo ya resuelto
+        # y se va DIRECTO a resolver_y_responder_catalogo (que ya usa la
+        # caché de búsquedas), sin pasar por tool-calling ni EntityResolver.
+        # ============================================
+        if cambio_de_contexto:
+            logger.info("⏭️ [Puerta 2.6] Saltada: cambio de contexto detectado en 2.5 → ruta normal del LLM")
+        elif es_aclaracion_de_busqueda(message, historial_texto, state):
+            logger.info("🔁 Mensaje tratado como ACLARACIÓN, reusando búsqueda previa")
+
+            state_manager.update_state(contact_id, {
+                'producto': state.get('ultimo_producto_consultado'),
+                'modelo': state.get('ultimo_modelo_consultado'),
+            })
+            state = state_manager.get_state(contact_id)
+
+            resultado_aclaracion = resolver_y_responder_catalogo(
+                state=state,
+                contact_id=contact_id,
+                intencion=state.get('ultima_intencion', 'intencion_compra'),
+                channel=channel,
+                historial_texto=historial_texto,
+                mensaje_actual=message,
+            )
+
+            if resultado_aclaracion is not None:
+                return resultado_aclaracion
+            logger.warning("⚠️ resolver_y_responder_catalogo devolvió None en aclaración, cayendo a flujo normal")
+
 
         # ============================================
         # 3. INICIALIZAR CLIENTE Y CACHE
@@ -144,9 +255,16 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
 
         # ============================================
         # 4. LLM: TOOL CALLING (Clasifica + Extrae entidades)
-        # NUEVO: El LLM es el extractor principal
         # ============================================
         herramientas = catalog_cache.get_herramientas()
+
+        # ✅ Construir texto con nombres Y descripciones
+        herramientas_texto = ""
+        for t in herramientas:
+            nombre = t['function']['name']
+            descripcion = t['function'].get('description', '')
+            herramientas_texto += f"- {nombre}: {descripcion}\n"
+
         logger.info(f"📋 Historial para tool calling: {len(historial_texto)} caracteres")
         if historial_texto:
             logger.info(f"📋 Primeros 200 caracteres del historial: {historial_texto[:200]}...")
@@ -158,6 +276,8 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             modelo=state.get('modelo', 'no especificado'),
             intencion=state.get('ultima_intencion', 'ninguna'),
             historial_texto=historial_texto,
+            mensaje=message,
+            herramientas_disponibles=herramientas_texto,  # ✅ Con descripciones
         )
 
         # 🔥 LOG DEL PROMPT COMPLETO

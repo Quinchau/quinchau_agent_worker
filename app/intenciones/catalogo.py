@@ -16,6 +16,7 @@ from openai import OpenAI
 from ..agent_state import AgentStateManager
 from ..ghl import send_message_to_ghl, send_multiple_messages
 from ..prompts import load_prompt
+from ..product_search_cache import obtener_candidatos
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +58,26 @@ def get_catalog_url_for_model(modelo: str) -> dict:
         return None
 
 
-def resolver_y_responder_catalogo(state, contact_id, intencion, channel):
+def resolver_y_responder_catalogo(state, contact_id, intencion, channel, historial_texto=None, mensaje_actual=None):
     """
     Resuelve producto+modelo y DELEGA al LLM la selección del producto correcto.
     🔥 SOLO ENVÍA LA URL - NADA DE TEXTO ADICIONAL
 
+    ✅ ANTES DE CONSULTAR:
+    - Busca primero en la caché de búsquedas (Redis, sin atar a contact_id)
+    - Solo pega al backend si no hay caché vigente para ese producto+modelo
+
     ✅ DESPUÉS DE RESOLVER:
     - Limpia el producto (ya se consultó)
     - Mantiene el modelo para contexto (el usuario puede seguir preguntando)
+
+    Args:
+        state: Estado del usuario desde Redis
+        contact_id: ID del contacto en GHL
+        intencion: Intención detectada
+        channel: Canal de comunicación
+        historial_texto: Historial de conversación desde GHL (opcional)
+        mensaje_actual: Mensaje actual del cliente (opcional)
     """
     try:
         producto = state.get('producto')
@@ -76,18 +89,16 @@ def resolver_y_responder_catalogo(state, contact_id, intencion, channel):
 
         logger.info(f"🔍 Resolviendo catálogo: producto='{producto}', modelo='{modelo}'")
 
-        with httpx.Client(timeout=CATALOG_TIMEOUT) as client:
-            response = client.post(
-                CATALOG_ENDPOINT,
-                json={"identidad_producto": producto, "identidad_modelo": modelo},
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        resultados = data.get('results', [])
+        catalogo_resp = obtener_candidatos(producto, modelo)
+        resultados = catalogo_resp["resultados"]
+        url_catalogo_cache = catalogo_resp["url_catalogo"]
+        logger.info(
+            f"📦 Candidatos {'(desde caché)' if catalogo_resp['from_cache'] else '(desde backend)'}: "
+            f"{len(resultados)}"
+        )
 
         if not resultados:
-            catalog_url = data.get('url')
+            catalog_url = url_catalogo_cache
 
             if catalog_url:
                 mensajes = [
@@ -107,7 +118,6 @@ def resolver_y_responder_catalogo(state, contact_id, intencion, channel):
 
             state_manager = AgentStateManager()
             state_manager.update_state(contact_id, {
-                'producto': None,
                 'entidades_no_resueltas': [],
                 'ultimo_producto_consultado': producto,
                 'ultimo_modelo_consultado': modelo,
@@ -136,7 +146,6 @@ def resolver_y_responder_catalogo(state, contact_id, intencion, channel):
 
             state_manager = AgentStateManager()
             state_manager.update_state(contact_id, {
-                'producto': None,
                 'entidades_no_resueltas': [],
                 'ultimo_producto_consultado': producto,
                 'ultimo_modelo_consultado': modelo,
@@ -159,27 +168,43 @@ def resolver_y_responder_catalogo(state, contact_id, intencion, channel):
         # ============================================
 
         productos_texto = ""
-        for i, item in enumerate(resultados[:10], 1):
+        for i, item in enumerate(resultados[:20], 1):
             productos_texto += f"{i}. {item.get('description')} (Código: {item.get('stockid')}) - Stock: {item.get('stock', 0)} unidades\n"
             productos_texto += f"   URL: {item.get('url')}\n\n"
 
-        historial_texto = ""
-        turnos = state.get('ultimos_turnos', [])[-3:]
-        if turnos:
-            historial_texto = "Historial reciente:\n"
-            for t in turnos:
-                historial_texto += f"Cliente: {t['cliente']}\n"
-                historial_texto += f"Asistente: {t['asistente']}\n\n"
+        # 🔥 USAR HISTORIAL DE GHL (prioridad) o fallback a Redis
+        if not historial_texto:
+            turnos = state.get('ultimos_turnos', [])[-3:]
+            if turnos:
+                historial_texto = "HISTORIAL RECIENTE:\n"
+                for t in turnos:
+                    historial_texto += f"Cliente: {t['cliente']}\n"
+                    historial_texto += f"Asistente: {t['asistente']}\n\n"
+            else:
+                historial_texto = ""
+
+        # 🔥 AGREGAR MENSAJE ACTUAL AL CONTEXTO
+        mensaje_contexto = ""
+        if mensaje_actual:
+            mensaje_contexto = f"MENSAJE ACTUAL DEL CLIENTE:\n\"{mensaje_actual}\"\n\n"
 
         prompt_seleccion = load_prompt(
-            "prompt_seleccion_catalogo",
+            "prompt_selector_producto",
             nombre_cliente=state.get('nombre_cliente', 'Cliente'),
             producto=producto,
             modelo=modelo,
             intencion=intencion,
             historial_texto=historial_texto,
+            mensaje_contexto=mensaje_contexto,
             productos_texto=productos_texto,
         )
+
+        # 🔥 LOG DEL PROMPT COMPLETO PARA DEBUG
+        logger.info("=" * 80)
+        logger.info("📝 PROMPT SELECCIÓN CATÁLOGO (COMPLETO):")
+        logger.info("=" * 80)
+        logger.info(prompt_seleccion)
+        logger.info("=" * 80)
 
         llm_client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
@@ -194,6 +219,13 @@ def resolver_y_responder_catalogo(state, contact_id, intencion, channel):
         )
 
         seleccion = json.loads(seleccion_response.choices[0].message.content)
+
+        # 🔥 LOG DE LA RESPUESTA DEL LLM
+        logger.info("=" * 80)
+        logger.info("📥 RESPUESTA LLM (SELECCIÓN CATÁLOGO):")
+        logger.info("=" * 80)
+        logger.info(json.dumps(seleccion, indent=2))
+        logger.info("=" * 80)
 
         if seleccion.get('seleccionado', False):
             url = seleccion.get('url', '')
@@ -224,7 +256,6 @@ def resolver_y_responder_catalogo(state, contact_id, intencion, channel):
 
         state_manager = AgentStateManager()
         state_manager.update_state(contact_id, {
-            'producto': None,
             'entidades_no_resueltas': [],
             'ultimo_producto_consultado': producto,
             'ultimo_modelo_consultado': modelo,

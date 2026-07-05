@@ -51,7 +51,9 @@ def handle(ctx: IntentContext) -> Optional[dict]:
             ctx.state, 
             ctx.contact_id, 
             ctx.intencion, 
-            ctx.channel
+            ctx.channel,
+            historial_texto=ctx.historial_texto,
+            mensaje_actual=ctx.message
         )
         
         if catalog_result:

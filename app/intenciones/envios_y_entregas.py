@@ -22,7 +22,7 @@ def handle(ctx: IntentContext) -> dict:
     ciudad = match.group(1).strip() if match else "tu ubicación"
 
     prompt_cotizar = load_prompt(
-        "prompt_intencion_cotizar_envio",
+        "prompt_envios_y_entregas",
         nombre=nombre,
         ciudad=ciudad,
     )

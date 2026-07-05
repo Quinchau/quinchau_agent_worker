@@ -110,8 +110,7 @@ def handle(ctx: IntentContext) -> dict:
     # 6. ENVIAR RESPUESTA
     # ============================================================
     send_message_to_ghl(ctx.contact_id, respuesta, ctx.channel)
-    ctx.state_manager.add_turno(ctx.contact_id, mensaje_usuario, respuesta)
-
+   
     # ============================================================
     # 7. ACTUALIZAR ESTADO
     # ============================================================
