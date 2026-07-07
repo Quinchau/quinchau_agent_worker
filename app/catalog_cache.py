@@ -1,17 +1,28 @@
 # app/catalog_cache.py
+import os
 import json
 import logging
+import requests
+from typing import List, Dict, Optional
 from .database import get_db_connection
 from .redis_queue import get_redis
 
 logger = logging.getLogger(__name__)
 
-CACHE_TTL = 300  # 5 minutos
+CACHE_TTL = 300  # 5 minutos (config: intenciones, herramientas, términos)
+CACHE_TTL_PRODUCTOS = 60  # 1 minuto (stock cambia más seguido que config)
 
 KEY_INTENCIONES = "catalog:intenciones"
 KEY_BLOQUEANTES = "catalog:bloqueantes"
 KEY_TERMINOS_PATTERNS = "catalog:terminos_patterns"
 KEY_HERRAMIENTAS = "catalog:herramientas"
+KEY_PRODUCTOS_MODELO = "catalog:productos_modelo:{modelo}"
+
+# URL base del API Node.js (desde CATALOG_URL_ENDPOINT)
+CATALOG_URL_ENDPOINT = os.getenv("CATALOG_URL_ENDPOINT", "http://quinchau-api:3003/api/agent/catalog-url")
+# Derivar productos-por-modelo de la misma base (reemplaza último segmento)
+CATALOG_PRODUCTOS_MODELO_URL = CATALOG_URL_ENDPOINT.replace("catalog-url", "productos-por-modelo")
+NODE_AGENT_TIMEOUT = 5  # segundos
 
 # JSON Schema no tiene tipos nativos de fecha/hora: se mapean a string + format
 TIPO_MAP = {
@@ -21,6 +32,7 @@ TIPO_MAP = {
     "boolean": "boolean",
     "date": "string",
     "time": "string",
+    "array": "array"
 }
 FORMATO_EXTRA = {
     "date": {"format": "date"},
@@ -28,12 +40,8 @@ FORMATO_EXTRA = {
 }
 
 # sin_clasificar SE INCLUYE como tool explícita (no se excluye).
-# Motivo: con tool_choice="required" el modelo siempre debe elegir algo, y
-# necesitamos que "no reconozco esto" sea una elección afirmativa y
-# reproducible, no lo que pasa por default cuando el modelo no llama
-# ninguna tool. Ver discusión: casos "chirulai"/"chuflin"/"chinchulin"
-# donde el mismo tipo de mensaje daba resultados distintos entre sí.
 EXCLUIR_DE_HERRAMIENTAS = set()
+
 
 class CatalogCache:
     def __init__(self):
@@ -45,7 +53,6 @@ class CatalogCache:
     # ============================================
 
     def get_intenciones(self):
-        """Lista de intenciones activas: [{'nombre':..., 'descripcion':...}, ...]"""
         try:
             cached = self.redis.get(KEY_INTENCIONES)
             if cached:
@@ -121,14 +128,9 @@ class CatalogCache:
 
     # ============================================
     # HERRAMIENTAS (tools) PARA TOOL CALLING
-    #    intenciones + entidades + intencion_entidad -> JSON schema
     # ============================================
 
     def get_herramientas(self):
-        """Lista de tools en formato OpenAI function-calling, generadas desde
-        las mismas tablas que ya usás para intenciones/entidades bloqueantes.
-        [{'type': 'function', 'function': {'name':..., 'description':..., 'parameters': {...}}}, ...]
-        """
         try:
             cached = self.redis.get(KEY_HERRAMIENTAS)
             if cached:
@@ -226,7 +228,6 @@ class CatalogCache:
     # ============================================
 
     def get_terminos_patterns(self):
-        """Lista ya combinada/deduplicada/ordenada por longitud DESC, lista para matching"""
         try:
             cached = self.redis.get(KEY_TERMINOS_PATTERNS)
             if cached:
@@ -314,13 +315,78 @@ class CatalogCache:
         all_patterns.sort(key=lambda x: len(x['pattern']), reverse=True)
         return all_patterns
 
+    # ============================================
+    # PRODUCTOS POR MODELO (nuevo)
+    #    Redis (TTL corto, stock variable) → Node (fuente de verdad) → Redis
+    # ============================================
 
-# TODO: cuando se retome la invalidación manual, los endpoints de edición
-# de términos/alias deberán llamar a algo como:
-#   CatalogCache().redis.delete(KEY_TERMINOS_PATTERNS)
-# justo después de un UPDATE/INSERT exitoso en terminos_semanticos o terminos_alias.
-#
-# Lo mismo aplica para KEY_HERRAMIENTAS: si editás intenciones, entidades o
-# intencion_entidad desde el panel de administración, hay que invalidar
-# también catalog:herramientas (y catalog:intenciones / catalog:bloqueantes,
-# que quedan redundantes una vez migrado el dispatcher a tool calling).
+    def get_productos_por_modelo(self, modelo: str) -> List[Dict]:
+        """
+        Catálogo completo de productos de un modelo (sin filtro de texto),
+        usado para poblar el enum del tool call.
+
+        Retorna SIEMPRE una lista (vacía en caso de error), nunca None —
+        así el resto del pipeline no necesita chequear None en cada uso.
+        """
+        if not modelo:
+            return []
+
+        modelo_normalizado = modelo.lower().strip()
+        cache_key = KEY_PRODUCTOS_MODELO.format(modelo=modelo_normalizado)
+
+        try:
+            cached = self.redis.get(cache_key)
+            if cached:
+                productos = json.loads(cached)
+                logger.info(f"📦 Cache hit productos de '{modelo}' ({len(productos)})")
+                return productos
+        except Exception as e:
+            logger.warning(f"⚠️ Redis no disponible (productos por modelo): {e}")
+            return self._fetch_productos_por_modelo_backend(modelo)
+
+        productos = self._fetch_productos_por_modelo_backend(modelo)
+        try:
+            self.redis.setex(cache_key, CACHE_TTL_PRODUCTOS, json.dumps(productos, default=str))
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo escribir cache de productos por modelo: {e}")
+        return productos
+
+    def _fetch_productos_por_modelo_backend(self, modelo: str) -> List[Dict]:
+        """
+        Llama al endpoint de Node (agent-resolver.service) que devuelve
+        TODOS los productos del modelo, sin filtro de texto.
+        """
+        # Usar CATALOG_PRODUCTOS_MODELO_URL que ya está definida al inicio del archivo
+        url = CATALOG_PRODUCTOS_MODELO_URL
+        try:
+            response = requests.post(
+                url,
+                json={"identidad_modelo": modelo},
+                headers={"Content-Type": "application/json"},
+                timeout=NODE_AGENT_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if not data.get("success"):
+                logger.warning(f"⚠️ Node respondió error para '{modelo}': {data.get('error')}")
+                return []
+
+            productos = data.get("data", {}).get("productos", [])
+            logger.info(f"✅ Catálogo de '{modelo}' obtenido de Node: {len(productos)} productos")
+            return productos
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"⚠️ Timeout consultando Node (productos por modelo) para '{modelo}'")
+            return []
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"⚠️ Error de conexión con Node (productos por modelo) para '{modelo}'")
+            return []
+        except Exception as e:
+            logger.error(f"❌ Error consultando Node (productos por modelo) para '{modelo}': {e}")
+            return []
+
+# ============================================
+# INSTANCIA GLOBAL PARA IMPORTACIÓN
+# ============================================
+catalog_cache = CatalogCache()

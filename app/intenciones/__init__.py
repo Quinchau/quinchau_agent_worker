@@ -17,13 +17,12 @@ from .context import IntentContext, obtener_manejador, registrar, intenciones_re
 
 from . import sin_clasificar  # noqa: F401,E402
 from . import envios_y_entregas  # noqa: F401,E402
-from . import retiro_y_pago_personal  # noqa: F401,E402
-from . import envio_por_delivery  # noqa: F401,E402
 from . import saludo  # noqa: F401,E402
 from . import compra_al_mayoreo  # noqa: F401,E402
 from . import ubicacion_horario  # noqa: F401,E402
 from . import orden_sin_despacho  # noqa: F401,E402
 from . import compra  # noqa: F401,E402
+from . import variante_producto  # noqa: F401,E402
 
 __all__ = [
     "IntentContext",

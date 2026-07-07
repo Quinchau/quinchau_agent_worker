@@ -8,20 +8,46 @@ CONTEXTO:
 
 {historial_texto}
 
-PRODUCTOS ENCONTRADOS:
+PRODUCTOS DISPONIBLES PARA ESTE MODELO:
 {productos_texto}
 
 INSTRUCCIONES:
-1. Busca en la lista de productos encontrados la opcion que mas coincidencia tenga con la peticion del cliente
+1. Todos los productos de la lista YA SON COMPATIBLES con el modelo del cliente
+   (el filtro de compatibilidad ya se hizo antes de mostrártelos). No descartes
+   un producto solo porque su nombre no menciona el modelo explícitamente.
 
-RESPUESTA EN JSON:
+2. Tu único criterio de selección es: ¿el nombre/descripción del producto
+   coincide con lo que pide el cliente?
+
+3. Si el cliente pide algo genérico (ej. "bujía", sin marca ni tipo específico),
+   devolvé TODOS los ids cuyo producto corresponda a ese tipo de repuesto,
+   sin importar cuántos sean.
+
+4. Si el cliente da un detalle que distingue un producto de los demás (marca,
+   variante, ubicación, capacidad, código específico), devolvé solo el/los
+   id(s) que matcheen ese detalle puntual.
+
+5. Nunca inventes ni modifiques un id. Elegí exclusivamente entre los ids
+   que aparecen en PRODUCTOS DISPONIBLES. No completes descripción, url,
+   precio ni stock — eso no es tu responsabilidad.
+
+6. Si ningún producto de la lista corresponde a lo que pide el cliente,
+   devolvé una lista vacía.
+
+7. Considera los siguientes tipos para clasificar
+- Tapa Swichera no es igual a Swichera
+- Tapa Carter no es igual a Carter
+
+8. TU RESPUESTA PUEDE INCLUIR MAXIMO 10 ids
+
+RESPONDÉ ÚNICAMENTE CON ESTE JSON, SIN TEXTO ADICIONAL:
 {{
-    "seleccionado": true/false,
-    "stockid": "259-897",
-    "description": "Mando Izquierdo HJ110",
-    "url": "https://quinchau.com/producto/259-897/mando-izquierdo-hj110",
-    "stock": 5,
-    "razon": "El cliente preguntó por 'el izquierdo', y este es el mando izquierdo con stock disponible"
+    "ids_seleccionados": ["259-897", "260-104"],
+    "razon": "El cliente preguntó por 'bujía NGK', y estos dos productos corresponden a bujías de esa marca compatibles con el modelo"
 }}
 
-Si ningún producto es relevante, responde con seleccionado=false.
+Si ningún producto coincide, respondé:
+{{
+    "ids_seleccionados": [],
+    "razon": "..."
+}}

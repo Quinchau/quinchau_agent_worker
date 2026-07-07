@@ -1,6 +1,10 @@
 CONTEXTO PREVIO:
 - entidad.producto: {producto}
 - entidad.modelo: {modelo}
+- intención anterior: {intencion}
+
+HISTORIAL DE LA CONVERSACIÓN:
+{historial_texto}
 
 MENSAJE ACTUAL DEL USUARIO:
 "{mensaje}"
@@ -12,3 +16,7 @@ REGLAS DE PRIORIDAD:
 1. Identifica la intención del usuario seleccionando UNA de las HERRAMIENTAS DISPONIBLES.
 2. Identifica y extrae las entidades de la intencion del mensaje actual.
 3. Si no logras identificar alguna, utiliza las del CONTEXTO PREVIO.
+4. Analiza el mensaje actual en el contexto del HISTORIAL DE LA CONVERSACIÓN para determinar si el cliente está haciendo una nueva solicitud,
+ continuando un tema anterior, o simplemente haciendo un comentario/aclaración.
+5. Responde en consecuencia: si es una continuación de un tema previo (ej: envíos, compras), usa la herramienta correspondiente.
+ Si es un comentario o aclaración sin intención de compra, usa sin_clasificar.
