@@ -13,10 +13,18 @@ HERRAMIENTAS DISPONIBLES:
 {herramientas_disponibles}
 
 REGLAS DE PRIORIDAD:
-1. Identifica la intención del usuario seleccionando UNA de las HERRAMIENTAS DISPONIBLES.
-2. Identifica y extrae las entidades de la intencion del mensaje actual.
-3. Si no logras identificar alguna, utiliza las del CONTEXTO PREVIO.
-4. Analiza el mensaje actual en el contexto del HISTORIAL DE LA CONVERSACIÓN para determinar si el cliente está haciendo una nueva solicitud,
- continuando un tema anterior, o simplemente haciendo un comentario/aclaración.
-5. Responde en consecuencia: si es una continuación de un tema previo (ej: envíos, compras), usa la herramienta correspondiente.
- Si es un comentario o aclaración sin intención de compra, usa sin_clasificar.
+1. Antes de elegir herramienta, evalúa si el MENSAJE ACTUAL DEL USUARIO es
+   coherente con el HISTORIAL DE LA CONVERSACIÓN: ¿responde lógicamente a lo
+   último que preguntó el asistente, o continúa naturalmente el tema previo?
+   Si el mensaje es ruido, un número/símbolo/palabra suelta sin relación
+   clara con lo que se venía hablando, o no aporta ninguna intención
+   identificable, usa sin_clasificar — incluso si existe CONTEXTO PREVIO
+   de compra, envío u otra intención.
+2. Si el mensaje es coherente con la conversación, identifica la intención
+   del usuario seleccionando UNA de las HERRAMIENTAS DISPONIBLES.
+3. Identifica y extrae las entidades de la intención del mensaje actual.
+4. Si no logras identificar alguna entidad, utiliza las del CONTEXTO PREVIO
+   (aplica solo si el mensaje fue clasificado como coherente en el paso 1).
+5. Si es una continuación de un tema previo (ej: envíos, compras), usa la
+   herramienta correspondiente. Si es un comentario o aclaración sin
+   intención de compra, usa sin_clasificar.

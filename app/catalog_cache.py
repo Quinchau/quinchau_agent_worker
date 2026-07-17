@@ -17,6 +17,7 @@ KEY_BLOQUEANTES = "catalog:bloqueantes"
 KEY_TERMINOS_PATTERNS = "catalog:terminos_patterns"
 KEY_HERRAMIENTAS = "catalog:herramientas"
 KEY_PRODUCTOS_MODELO = "catalog:productos_modelo:{modelo}"
+KEY_SYSTEM_FAQS = "catalog:system_faqs"
 
 # URL base del API Node.js (desde CATALOG_URL_ENDPOINT)
 CATALOG_URL_ENDPOINT = os.getenv("CATALOG_URL_ENDPOINT", "http://quinchau-api:3003/api/agent/catalog-url")
@@ -81,6 +82,42 @@ class CatalogCache:
                 return cursor.fetchall()
         except Exception as e:
             logger.error(f"❌ Error consultando intenciones: {e}")
+            return []
+
+    # ============================================
+    # SYSTEM FAQS (preguntas generales del negocio)
+    # ============================================
+
+    def get_system_faqs(self):
+        """Retorna [{id, question, answer}, ...] de FAQs activas del negocio."""
+        try:
+            cached = self.redis.get(KEY_SYSTEM_FAQS)
+            if cached:
+                return json.loads(cached)
+        except Exception as e:
+            logger.warning(f"⚠️ Redis no disponible (get system_faqs), usando BD directo: {e}")
+            return self._load_system_faqs_from_db()
+
+        data = self._load_system_faqs_from_db()
+        try:
+            self.redis.setex(KEY_SYSTEM_FAQS, CACHE_TTL, json.dumps(data, default=str))
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo escribir cache de system_faqs: {e}")
+        return data
+
+    def _load_system_faqs_from_db(self):
+        query = """
+        SELECT id, question, answer
+        FROM system_faqs
+        WHERE activo = 1
+        ORDER BY sort_order
+        """
+        try:
+            with self.db.cursor() as cursor:
+                cursor.execute(query)
+                return cursor.fetchall()
+        except Exception as e:
+            logger.error(f"❌ Error consultando system_faqs: {e}")
             return []
 
     # ============================================

@@ -1,6 +1,7 @@
 # app/entity_resolver.py
+import re
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from .catalog_cache import catalog_cache
 from .agent_state import AgentStateManager
 
@@ -68,10 +69,59 @@ class EntityResolver:
 
         return best_match
 
+    def buscar_productos(self, texto: str) -> List[Dict[str, Any]]:
+        """
+        Busca TODOS los matches de tipo 'producto' en el catálogo de
+        términos/alias presentes en `texto` (a diferencia de buscar_modelo,
+        que devuelve solo el mejor match — un mensaje puede referirse a más
+        de un producto/alias, ej. "cochinito y espejo retro").
+        """
+        if not texto:
+            return []
+
+        normalized = self.normalize_text(texto)
+        all_patterns = self.cache.get_terminos_patterns()
+
+        matches = []
+        for item in all_patterns:
+            if item['entidad_nombre'] != 'producto':
+                continue
+            if self._text_matches(normalized, item['pattern']):
+                matches.append({
+                    'termino': item['termino'],
+                    'pattern': item['pattern'],
+                    'priority': self._calculate_priority(normalized, item['pattern']),
+                })
+
+        # Evita que un alias corto quede reemplazado antes que uno largo que
+        # lo contiene (ej. "espejo" vs "espejo retro"); se resuelve primero
+        # el más largo/específico.
+        matches.sort(key=lambda m: (len(m['pattern']), m['priority']), reverse=True)
+        return matches
+
+
+    def resolver_productos_alias(self, texto: str) -> List[Dict[str, str]]:
+        """
+        Versión de resolver_modelo() para producto: NO devuelve un único
+        'mejor' match ni asume estado persistente — solo resuelve lo que
+        esté explícitamente en el mensaje actual, para normalizarlo antes
+        de la llamada al LLM. No hay 'producto heredado' entre turnos.
+        """
+        matches = self.buscar_productos(texto)
+        resueltos = [{'producto': m['termino'], 'alias': m['pattern']} for m in matches]
+
+        for r in resueltos:
+            logger.info(f"✅ Alias de producto: '{r['alias']}' → '{r['producto']}'")
+
+        return resueltos
+
     def _text_matches(self, query: str, term: str) -> bool:
         """
         Verifica si query coincide con término del catálogo.
-        SOLO matchea términos completos, NO subcadenas parciales.
+        Matchea términos completos, y también frases multi-palabra del
+        término/alias que aparezcan contiguas dentro del query (o viceversa),
+        respetando límites de palabra — NO matchea subcadenas parciales
+        dentro de una palabra (ej. "70" no matchea dentro de "170").
         """
         if not query or not term:
             return False
@@ -80,6 +130,14 @@ class EntityResolver:
         term_normalized = self.normalize_text(term)
 
         if query_normalized == term_normalized:
+            return True
+
+        # Frase contigua con límites de palabra (cubre alias multi-palabra
+        # embebidos en un mensaje más largo, ej. term="dr 650" dentro de
+        # query="suichera dr 650")
+        if re.search(r'\b' + re.escape(term_normalized) + r'\b', query_normalized):
+            return True
+        if re.search(r'\b' + re.escape(query_normalized) + r'\b', term_normalized):
             return True
 
         query_words = query_normalized.split()

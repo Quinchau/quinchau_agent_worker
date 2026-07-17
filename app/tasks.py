@@ -52,56 +52,6 @@ async def classify_user_preference_task(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _parchar_enum_producto(herramientas: List[Dict], productos: List[Dict], bloqueantes_map: Dict) -> List[Dict]:
-    if not productos:
-        return herramientas
-
-    opciones = [p['id'] for p in productos if p.get('id')]
-    opciones.append(VALOR_SIN_MATCH_PRODUCTO)
-
-    herramientas_parcheadas = copy.deepcopy(herramientas)
-
-    for tool in herramientas_parcheadas:
-        nombre_intencion = tool['function']['name']
-        entidades_bloqueantes = bloqueantes_map.get(nombre_intencion, [])
-
-        if 'producto' not in entidades_bloqueantes:
-            continue
-
-        propiedades = tool['function']['parameters']['properties']
-        if 'producto' in propiedades:
-            listado_legible = "; ".join(
-                f"{p['id']}: {p['nombre']}" for p in productos if p.get('id')
-            )
-            descripcion_base = propiedades['producto'].get('description', '')
-            ejemplo_id = opciones[0] if opciones else 'ID'
-
-            propiedades['producto'] = {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": opciones
-                },
-                "description": (
-                    f"{descripcion_base} "
-                    f"IMPORTANTE: la respuesta SIEMPRE es una lista, incluso con un solo "
-                    f"resultado — ej. ['{ejemplo_id}'], nunca un string suelto sin corchetes. "
-                    f"TODOS los productos de este catálogo YA SON COMPATIBLES con el modelo "
-                    f"del cliente (el filtro de compatibilidad ya se hizo antes) — no descartes "
-                    f"un producto solo porque su nombre no menciona el modelo. "
-                    f"Tu único criterio es: ¿el NOMBRE del producto coincide con lo que pide "
-                    f"el cliente? Si el cliente pide algo genérico (ej. 'bujía' sin marca ni "
-                    f"tipo), devolvé TODOS los productos cuyo nombre corresponda a ese tipo de "
-                    f"repuesto, sin importar cuántos sean. Si el cliente da un detalle que "
-                    f"distingue un producto de los demás (marca, variante, ubicación, "
-                    f"capacidad, código específico), devolvé solo el/los que matcheen ese "
-                    f"detalle. Catálogo disponible: {listado_legible}. "
-                    f"Si ninguno corresponde, devolvé únicamente ['{VALOR_SIN_MATCH_PRODUCTO}']."
-                ),
-            }
-
-    return herramientas_parcheadas
-
 # ============================================
 # HELPERS DEL NUEVO FLUJO
 # ============================================
@@ -201,7 +151,7 @@ def _llamar_llm_tool_calling(
         ],
         tools=herramientas,
         tool_choice="required",
-        temperature=0.1,
+        temperature=0.0,
     )
 
     msg = tool_response.choices[0].message
@@ -342,6 +292,19 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
         # mensaje actual e historial — para que ninguna llamada quede
         # expuesta al alias crudo.
         message_normalizado = _normalizar_alias(message, alias_usado, modelo_resuelto)
+        historial_normalizado = _normalizar_alias(historial_texto, alias_usado, modelo_resuelto)
+
+        # ============================================
+        # 2.6 GATE — RESOLVER ALIAS DE PRODUCTO (solo normalización de mensaje,
+        # SIN persistir en state — a diferencia de modelo, producto no es
+        # contexto que se herede entre turnos)
+        # ============================================
+        matches_producto = entity_resolver.resolver_productos_alias(message)
+
+        message_normalizado = _normalizar_alias(message, alias_usado, modelo_resuelto)
+        for m in matches_producto:
+            message_normalizado = _normalizar_alias(message_normalizado, m['alias'], m['producto'])
+
         historial_normalizado = _normalizar_alias(historial_texto, alias_usado, modelo_resuelto)
 
         # ============================================
