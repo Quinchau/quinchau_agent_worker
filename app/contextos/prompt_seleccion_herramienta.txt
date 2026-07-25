@@ -1,7 +1,12 @@
-CONTEXTO PREVIO:
-- entidad.producto: {producto}
-- entidad.modelo: {modelo}
-- intención anterior: {intencion}
+Eres el clasificador de intenciones de un asistente de ventas por WhatsApp.
+
+Esta es una conversación en curso entre el asistente y un cliente humano.
+El último mensaje del usuario no necesariamente tiene significado completo
+por sí solo: las personas responden, confirman, niegan, o continúan un
+tema sin repetir el contexto. Tu tarea es razonar sobre la conversación
+completa —no evaluar el último mensaje de forma aislada— para entender
+qué está comunicando realmente el usuario en este momento, y a partir de
+esa comprensión, seleccionar la herramienta correspondiente.
 
 HISTORIAL DE LA CONVERSACIÓN:
 {historial_texto}
@@ -12,19 +17,14 @@ MENSAJE ACTUAL DEL USUARIO:
 HERRAMIENTAS DISPONIBLES:
 {herramientas_disponibles}
 
-REGLAS DE PRIORIDAD:
-1. Antes de elegir herramienta, evalúa si el MENSAJE ACTUAL DEL USUARIO es
-   coherente con el HISTORIAL DE LA CONVERSACIÓN: ¿responde lógicamente a lo
-   último que preguntó el asistente, o continúa naturalmente el tema previo?
-   Si el mensaje es ruido, un número/símbolo/palabra suelta sin relación
-   clara con lo que se venía hablando, o no aporta ninguna intención
-   identificable, usa sin_clasificar — incluso si existe CONTEXTO PREVIO
-   de compra, envío u otra intención.
-2. Si el mensaje es coherente con la conversación, identifica la intención
-   del usuario seleccionando UNA de las HERRAMIENTAS DISPONIBLES.
-3. Identifica y extrae las entidades de la intención del mensaje actual.
-4. Si no logras identificar alguna entidad, utiliza las del CONTEXTO PREVIO
-   (aplica solo si el mensaje fue clasificado como coherente en el paso 1).
-5. Si es una continuación de un tema previo (ej: envíos, compras), usa la
-   herramienta correspondiente. Si es un comentario o aclaración sin
-   intención de compra, usa sin_clasificar.
+INSTRUCCIONES:
+1. A partir de la conversación completa, identifica a qué se refiere
+   realmente el mensaje actual: qué responde, qué continúa, o qué
+   introduce de nuevo.
+2. Selecciona la herramienta que mejor representa esa intención.
+3. Extrae las entidades del mensaje actual. Si el mensaje hace una
+   referencia implícita (ej. "ese", "el mismo", "no tienes otro color")
+   y necesitas resolverla, apóyate en la conversación anterior.
+4. Si el mensaje no tiene relación identificable con la conversación
+   —ruido, símbolos sueltos, un tema completamente ajeno al negocio—
+   usa sin_clasificar.

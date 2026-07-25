@@ -1,6 +1,3 @@
-"""
-Helpers de envío de mensajes a GoHighLevel (GHL).
-"""
 import logging
 import os
 import time

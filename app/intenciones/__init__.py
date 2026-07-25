@@ -21,8 +21,10 @@ from . import saludo  # noqa: F401,E402
 from . import compra_al_mayoreo  # noqa: F401,E402
 from . import ubicacion_horario  # noqa: F401,E402
 from . import orden_sin_despacho  # noqa: F401,E402
-from . import compra  # noqa: F401,E402
+from . import busqueda_de_producto  # noqa: F401,E402
 from . import variante_producto  # noqa: F401,E402
+from . import informacion_general  # noqa: F401,E402
+
 
 __all__ = [
     "IntentContext",

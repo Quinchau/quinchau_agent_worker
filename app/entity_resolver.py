@@ -71,10 +71,10 @@ class EntityResolver:
 
     def buscar_productos(self, texto: str) -> List[Dict[str, Any]]:
         """
-        Busca TODOS los matches de tipo 'producto' en el catálogo de
-        términos/alias presentes en `texto` (a diferencia de buscar_modelo,
-        que devuelve solo el mejor match — un mensaje puede referirse a más
-        de un producto/alias, ej. "cochinito y espejo retro").
+        Busca los matches de tipo 'producto' en `texto`, sin solapamientos:
+        si un alias más largo cubre el mismo tramo de texto que uno más corto
+        (ej. "la instalacion" contiene a "instalacion"), solo se conserva el
+        más largo/específico.
         """
         if not texto:
             return []
@@ -82,22 +82,35 @@ class EntityResolver:
         normalized = self.normalize_text(texto)
         all_patterns = self.cache.get_terminos_patterns()
 
-        matches = []
+        candidatos = []
         for item in all_patterns:
             if item['entidad_nombre'] != 'producto':
                 continue
             if self._text_matches(normalized, item['pattern']):
-                matches.append({
+                pattern_normalizado = self.normalize_text(item['pattern'])
+                candidatos.append({
                     'termino': item['termino'],
                     'pattern': item['pattern'],
+                    'pattern_normalizado': pattern_normalizado,
                     'priority': self._calculate_priority(normalized, item['pattern']),
                 })
 
-        # Evita que un alias corto quede reemplazado antes que uno largo que
-        # lo contiene (ej. "espejo" vs "espejo retro"); se resuelve primero
-        # el más largo/específico.
-        matches.sort(key=lambda m: (len(m['pattern']), m['priority']), reverse=True)
-        return matches
+        # Más largo (y luego mayor prioridad) primero
+        candidatos.sort(key=lambda m: (len(m['pattern_normalizado']), m['priority']), reverse=True)
+
+        aceptados = []
+        for cand in candidatos:
+            # Si el pattern de un candidato ya aceptado contiene a este
+            # (como substring de palabra completa), es un match redundante
+            solapa = any(
+                cand['pattern_normalizado'] != ok['pattern_normalizado']
+                and re.search(r'\b' + re.escape(cand['pattern_normalizado']) + r'\b', ok['pattern_normalizado'])
+                for ok in aceptados
+            )
+            if not solapa:
+                aceptados.append(cand)
+
+        return aceptados
 
 
     def resolver_productos_alias(self, texto: str) -> List[Dict[str, str]]:

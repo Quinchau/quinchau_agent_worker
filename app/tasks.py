@@ -3,6 +3,9 @@ import json
 import copy
 import re
 import logging
+import io
+import httpx
+from .ghl import send_message_to_ghl
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -26,7 +29,7 @@ SYNC_MODE = os.getenv("SYNC_MODE", "false").lower() == "true"
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
 INTENCION_FALLBACK = "sin_clasificar"
-VALOR_SIN_MATCH_PRODUCTO = "ninguno_coincide"
+# VALOR_SIN_MATCH_PRODUCTO = "ninguno_coincide"
 
 
 # ============================================
@@ -56,55 +59,69 @@ async def classify_user_preference_task(data: Dict[str, Any]) -> Dict[str, Any]:
 # HELPERS DEL NUEVO FLUJO
 # ============================================
 
-def _parchar_enum_producto(herramientas: List[Dict], productos: List[Dict], bloqueantes_map: Dict) -> List[Dict]:
+def _inyectar_razonamiento(herramientas: List[Dict]) -> List[Dict]:
     """
-    Devuelve una copia de `herramientas` donde, para toda intención cuyas
-    entidades bloqueantes incluyan 'producto', la propiedad 'producto' del
-    schema pasa de texto libre a un enum con los productos reales del
-    modelo vigente + un valor especial para "no está en la lista".
+    Agrega un campo 'razonamiento' obligatorio, como primera propiedad,
+    al schema de cada tool — para forzar que el modelo articule el tema
+    real del mensaje antes de comprometerse con la selección de función.
+
+    Con tool_choice="required", el modelo solo puede responder con
+    argumentos de función (no hay canal de texto libre). Sin este campo,
+    el modelo salta directo de "hay un producto referenciado" a elegir
+    intencion_compra, sin distinguir si la pregunta es sobre el producto
+    o sobre el proceso de compra (pago, envío, etc.) que solo lo
+    menciona de forma incidental.
     """
-    if not productos:
-        return herramientas
-
-    opciones = [p.get('stockid') or p.get('id') for p in productos if p.get('stockid') or p.get('id')]
-    opciones.append(VALOR_SIN_MATCH_PRODUCTO)
-
     herramientas_parcheadas = copy.deepcopy(herramientas)
 
     for tool in herramientas_parcheadas:
-        nombre_intencion = tool['function']['name']
-        entidades_bloqueantes = bloqueantes_map.get(nombre_intencion, [])
+        params = tool['function']['parameters']
+        propiedades_originales = params.get('properties', {})
 
-        if 'producto' not in entidades_bloqueantes:
-            continue
-
-        propiedades = tool['function']['parameters']['properties']
-        if 'producto' in propiedades:
-            propiedades['producto']['enum'] = opciones
-            # Descripción con contexto legible para el LLM (nombre/descr real
-            # de cada producto, no solo el id)
-            listado_legible = "; ".join(
-                f"{p.get('stockid') or p.get('id')}: {p.get('description') or p.get('nombre', '')}"
-                for p in productos
-            )
-            propiedades['producto']['description'] = (
-                f"{propiedades['producto'].get('description', '')} "
-                f"Elegí uno de estos productos reales del catálogo: {listado_legible}. "
-                f"Si ninguno corresponde a lo que pide el cliente, usá '{VALOR_SIN_MATCH_PRODUCTO}'."
-            )
+        params['properties'] = {
+            "razonamiento": {
+                "type": "string",
+                "description": (
+                    "Antes de completar el resto de los campos, explica en "
+                    "una frase: (1) a qué se refiere el mensaje actual dado "
+                    "el historial de la conversación, y (2) cuál es el tema "
+                    "real de la pregunta — ¿es sobre el producto en sí "
+                    "(disponibilidad, precio, variante), o sobre el proceso "
+                    "de compra (pago, envío, horario, garantía)? Sé "
+                    "explícito sobre esta distinción incluso si un producto "
+                    "está implícito o referenciado en la oración (ej. por "
+                    "un pronombre como 'la'/'lo')."
+                ),
+            },
+            **propiedades_originales,
+        }
+        params['required'] = ["razonamiento"] + params.get('required', [])
 
     return herramientas_parcheadas
 
+_ACENTOS = {
+    'a': 'aáàâã', 'e': 'eéèê', 'i': 'iíìî',
+    'o': 'oóòôõ', 'u': 'uúùû', 'n': 'nñ',
+}
+
+def _patron_insensible_a_acentos(palabra: str) -> str:
+    """Construye un patrón regex que matchea la palabra sin importar
+    tildes/acentos en el texto real (ej. 'instalacion' matchea 'instalación')."""
+    partes = []
+    for ch in palabra:
+        variantes = _ACENTOS.get(ch.lower())
+        if variantes:
+            partes.append(f'[{variantes}{variantes.upper()}]')
+        else:
+            partes.append(re.escape(ch))
+    return ''.join(partes)
+
+
 def _normalizar_alias(texto: str, alias: Optional[str], modelo: str) -> str:
-    """
-    Reemplaza el alias de modelo detectado por su término canónico,
-    para que el LLM vea concordancia entre el mensaje y el modelo ya
-    resuelto en el state (ej. "artistic" -> "JOGS").
-    """
     if not texto or not alias:
         return texto
 
-    patron = r'\b' + re.escape(alias) + r'\b'
+    patron = r'\b' + _patron_insensible_a_acentos(alias) + r'\b'
     return re.sub(patron, modelo, texto, flags=re.IGNORECASE)
 
 
@@ -164,7 +181,8 @@ def _llamar_llm_tool_calling(
             entidades_detectadas = json.loads(primera.function.arguments)
         except json.JSONDecodeError:
             entidades_detectadas = {}
-        razon = f"Tool seleccionada por el modelo: {intencion}"
+        razonamiento_modelo = entidades_detectadas.pop('razonamiento', '')
+        razon = f"Tool seleccionada por el modelo: {intencion} | Razonamiento: {razonamiento_modelo}"
     else:
         intencion = INTENCION_FALLBACK
         entidades_detectadas = {}
@@ -186,9 +204,50 @@ def _llamar_llm_tool_calling(
 # PROCESAMIENTO DE MENSAJES GHL
 # ============================================
 
+EXTENSIONES_AUDIO = ('.ogg', '.mp3', '.m4a', '.wav', '.aac', '.mpeg', '.mp4')
+MENSAJES_CENTINELA_SIN_TEXTO = {"mensaje no encontrado", ""}
+
+EXTENSIONES_IMAGEN = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
+
+def _es_imagen(url: str) -> bool:
+    return bool(url) and url.lower().split('?')[0].endswith(EXTENSIONES_IMAGEN)
+
+
+def _es_audio(url: str) -> bool:
+    return bool(url) and url.lower().split('?')[0].endswith(EXTENSIONES_AUDIO)
+
+
+def _transcribir_audio(url_audio: str, client: OpenAI) -> Optional[str]:
+    """
+    Descarga el adjunto de audio (nota de voz de WhatsApp vía GHL) y lo
+    transcribe con Whisper a través de OpenRouter. Devuelve None si falla,
+    para que el caller decida el mensaje de fallback.
+    """
+    try:
+        resp = httpx.get(url_audio, timeout=30.0)
+        resp.raise_for_status()
+
+        extension = url_audio.lower().split('?')[0].rsplit('.', 1)[-1]
+        audio_file = io.BytesIO(resp.content)
+        audio_file.name = f"nota_voz.{extension}"
+
+        transcripcion = client.audio.transcriptions.create(
+            model="openai/whisper-1",
+            file=audio_file,
+            language="es",
+        )
+        texto = transcripcion.text.strip()
+        logger.info(f"🎙️ Nota de voz transcrita: {texto[:80]}...")
+        return texto or None
+    except Exception as e:
+        logger.error(f"❌ Error transcribiendo audio: {e}")
+        return None
+
+
 def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
     """Procesa el mensaje de GHL:
-    FLUJO: Gate 2.5 (modelo, solo contexto) → LLM tool-calling (una sola
+    FLUJO: Transcripción de audio (si aplica) → Gate 2.5 (modelo, solo
+    contexto) → Gate 2.6 (alias de producto) → LLM tool-calling (una sola
     pasada, sin enum de producto) → Handler (cada intención resuelve su
     propia lógica de catálogo/producto si la necesita).
     """
@@ -211,6 +270,33 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"📥 Mensaje: {message}")
         logger.info(f"👤 Usuario: {first_name} {last_name} ({contact_id})")
         logger.info("=" * 60)
+
+        # ============================================
+        # 1.5 CLIENTE OPENAI (se crea temprano: lo necesita tanto la
+        # transcripción de audio como el resto del pipeline más abajo)
+        # ============================================
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+        )
+
+        # ============================================
+        # 1.6 GATE — TRANSCRIPCIÓN DE NOTA DE VOZ (si el mensaje no trajo
+        # texto real pero sí un adjunto de audio en customData)
+        # ============================================
+        custom_data = task_data.get('custom_data', {}) or {}
+        attachment_url = custom_data.get('attachments') or ''
+
+        if message.strip().lower() in MENSAJES_CENTINELA_SIN_TEXTO and _es_audio(attachment_url):
+            logger.info(f"🎙️ Adjunto de audio detectado, transcribiendo — {first_name}")
+            texto_transcrito = _transcribir_audio(attachment_url, client)
+
+            if texto_transcrito:
+                message = texto_transcrito
+                logger.info(f"🔄 Mensaje reemplazado por transcripción: {message[:80]}...")
+            else:
+                message = "[Nota de voz recibida, no pude transcribirla]"
+                logger.warning("⚠️ Transcripción falló, usando mensaje de fallback")
 
         # ============================================
         # 2. ESTADO EN REDIS
@@ -263,7 +349,33 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                     }
 
         # ============================================
-        # 2.5 GATE — RESOLVER MODELO (solo contexto, sin catálogo)
+        # 2.5 GATE — IMAGEN RECIBIDA (por ahora no se procesa,
+        # se deriva sin pasar por clasificación de intención)
+        # ============================================
+        if message.strip().lower() in MENSAJES_CENTINELA_SIN_TEXTO and _es_imagen(attachment_url):
+            logger.info(f"🖼️ Imagen detectada, derivando (sin clasificar intención) — {first_name}")
+
+            mensaje = "Recibí tu imagen, dame un momento que la reviso y te respondo."
+            send_message_to_ghl(contact_id, mensaje, channel)
+
+            state_manager.update_state(contact_id, {
+                'ultima_intencion': 'imagen_recibida',
+                'esperando_confirmacion': False,
+                'esperando_respuesta': False,
+            })
+
+            return {
+                "success": True,
+                "response": mensaje,
+                "contact_id": contact_id,
+                "intencion": "imagen_recibida",
+                "fallback": True,
+                "fallback_tipo": "imagen_no_procesada",
+                "processed_at": datetime.now().isoformat(),
+            }
+
+        # ============================================
+        # 2.6 GATE — RESOLVER MODELO (solo contexto, sin catálogo)
         # ============================================
         resultado_gate = entity_resolver.resolver_modelo(message)
 
@@ -287,20 +399,17 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             alias_usado = state.get('alias_modelo')
             logger.info(f"ℹ️ Gate 2.5: sin match en mensaje, modelo heredado='{modelo_resuelto}'")
 
-        # Normaliza el alias (del mensaje actual o heredado del state) a su
-        # término canónico, en TODO lo que vaya a viajar hacia un LLM —
-        # mensaje actual e historial — para que ninguna llamada quede
-        # expuesta al alias crudo.
-        message_normalizado = _normalizar_alias(message, alias_usado, modelo_resuelto)
-        historial_normalizado = _normalizar_alias(historial_texto, alias_usado, modelo_resuelto)
-
         # ============================================
-        # 2.6 GATE — RESOLVER ALIAS DE PRODUCTO (solo normalización de mensaje,
+        # 2.7 GATE — RESOLVER ALIAS DE PRODUCTO (solo normalización de mensaje,
         # SIN persistir en state — a diferencia de modelo, producto no es
         # contexto que se herede entre turnos)
         # ============================================
         matches_producto = entity_resolver.resolver_productos_alias(message)
 
+        # Normaliza el alias de modelo (del mensaje actual o heredado del
+        # state) y luego los alias de producto detectados — en TODO lo que
+        # vaya a viajar hacia un LLM, para que ninguna llamada quede
+        # expuesta a jerga/alias crudo.
         message_normalizado = _normalizar_alias(message, alias_usado, modelo_resuelto)
         for m in matches_producto:
             message_normalizado = _normalizar_alias(message_normalizado, m['alias'], m['producto'])
@@ -308,14 +417,10 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
         historial_normalizado = _normalizar_alias(historial_texto, alias_usado, modelo_resuelto)
 
         # ============================================
-        # 4. CLIENTE OPENAI + TOOLS BASE
+        # 4. TOOLS BASE (el cliente OpenAI ya se creó en el paso 1.5)
         # ============================================
-        client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.getenv("OPENROUTER_API_KEY"),
-        )
-
         herramientas_base = catalog_cache.get_herramientas()
+        herramientas_base = _inyectar_razonamiento(herramientas_base)
 
         # ============================================
         # 5. LLAMADA AL LLM — solo clasifica intención, sin enum de producto
@@ -374,7 +479,6 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 logger.info(f"🔄 Inyección de prompt detectada para: {intencion}")
                 try:
                     from app.intenciones.inyection_prompt_from_tool import inyectar_y_generar
-                    from app.ghl import send_message_to_ghl
 
                     respuesta = inyectar_y_generar(
                         tool_output=resultado_manejador['tool_output'],
@@ -411,13 +515,27 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                     logger.error(f"❌ Error en flujo de inyección: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
-                    if resultado_manejador is not None:
+                    
+                    # Intentar usar el resultado tradicional del manejador como fallback
+                    if resultado_manejador is not None and resultado_manejador.get('response'):
                         logger.info("ℹ️ Fallback al resultado tradicional del manejador")
                         state_manager.update_state(contact_id, {
                             'esperando_confirmacion': False,
                             'esperando_respuesta': False,
                         })
                         return resultado_manejador
+                    else:
+                        # Si no hay respuesta del manejador, enviar mensaje genérico de error
+                        mensaje_error = "Lo siento, tuve un problema procesando tu mensaje. ¿Podrías intentarlo de nuevo?"
+                        send_message_to_ghl(contact_id, mensaje_error, channel)
+                        return {
+                            "success": True,
+                            "response": mensaje_error,
+                            "contact_id": contact_id,
+                            "intencion": intencion,
+                            "error": True,
+                            "processed_at": datetime.now().isoformat(),
+                        }
 
             if resultado_manejador is not None:
                 logger.info(f"ℹ️ Flujo tradicional para: {intencion}")
@@ -456,7 +574,6 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
         import traceback
         logger.error(traceback.format_exc())
         raise
-
 
 def enqueue_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
     queue = get_queue(QUEUE_AI)

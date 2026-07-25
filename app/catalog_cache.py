@@ -121,49 +121,6 @@ class CatalogCache:
             return []
 
     # ============================================
-    # ENTIDADES BLOQUEANTES POR INTENCIÓN
-    # ============================================
-
-    def get_bloqueantes_map(self):
-        """Dict {intencion_nombre: [entidad1, entidad2, ...]}"""
-        try:
-            cached = self.redis.get(KEY_BLOQUEANTES)
-            if cached:
-                return json.loads(cached)
-        except Exception as e:
-            logger.warning(f"⚠️ Redis no disponible (get bloqueantes), usando BD directo: {e}")
-            return self._load_bloqueantes_from_db()
-
-        data = self._load_bloqueantes_from_db()
-        try:
-            self.redis.setex(KEY_BLOQUEANTES, CACHE_TTL, json.dumps(data, default=str))
-        except Exception as e:
-            logger.warning(f"⚠️ No se pudo escribir cache de bloqueantes: {e}")
-        return data
-
-    def _load_bloqueantes_from_db(self):
-        query = """
-        SELECT i.nombre as intencion, e.nombre as entidad
-        FROM intenciones i
-        JOIN intencion_entidad ie ON i.id = ie.id_intencion
-        JOIN entidades e ON ie.id_entidad = e.id
-        WHERE ie.bloqueante = 1 AND i.activo = 1
-        ORDER BY i.nombre, ie.orden_prioridad
-        """
-        try:
-            with self.db.cursor() as cursor:
-                cursor.execute(query)
-                rows = cursor.fetchall()
-        except Exception as e:
-            logger.error(f"❌ Error consultando entidades bloqueantes: {e}")
-            return {}
-
-        result = {}
-        for row in rows:
-            result.setdefault(row['intencion'], []).append(row['entidad'])
-        return result
-
-    # ============================================
     # HERRAMIENTAS (tools) PARA TOOL CALLING
     # ============================================
 
