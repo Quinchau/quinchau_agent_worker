@@ -2,15 +2,19 @@ import os
 import re
 import io
 import base64
+import logging
 import httpx
 from typing import Dict, Any, List, Optional
 from PIL import Image
-from sqlalchemy import text
 from dotenv import load_dotenv
 import math
 from PIL import Image, ImageDraw, ImageFont
 
+from app.database import get_db_cursor  # Inserción del context manager del pool
+
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_KEY     = os.getenv("OPENROUTER_API_KEY", "")
@@ -36,12 +40,6 @@ def _call_openrouter(messages: list, max_tokens: int = 150, temperature: float =
     response = httpx.post(OPENROUTER_API_URL, json=payload, headers=headers, timeout=30)
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"].strip()
-
-
-def _get_db():
-    """Importación lazy del engine para no romper el módulo si MySQL no está disponible"""
-    from app.database import get_db_connection
-    return get_db_connection()
 
 
 # ---------------------------------------------------------------
@@ -87,27 +85,26 @@ Reglas:
 
     result = _parse_classification(content)
 
-    # Persistir en MySQL
+    # Persistir en MySQL utilizando el pool de conexiones
+    query = """
+        UPDATE users
+        SET preference_category    = %s,
+            preference_confidence  = %s,
+            last_classification_at = NOW()
+        WHERE id = %s
+    """
+    params = (
+        result["category"],
+        result.get("confidence", 70),
+        data["user_id"],
+    )
+
     try:
-        with _get_db() as conn:
-            conn.execute(
-                text("""
-                    UPDATE users
-                    SET preference_category    = :category,
-                        preference_confidence  = :confidence,
-                        last_classification_at = NOW()
-                    WHERE id = :user_id
-                """),
-                {
-                    "category":   result["category"],
-                    "confidence": result.get("confidence", 70),
-                    "user_id":    data["user_id"],
-                },
-            )
-            conn.commit()
-        print(f"[job] usuario {data['user_id']} → {result['category']} ({result.get('confidence')}%)")
+        with get_db_cursor() as cursor:
+            cursor.execute(query, params)
+        logger.info(f"✅ Usuario {data['user_id']} clasificado: {result['category']} ({result.get('confidence')}%)")
     except Exception as e:
-        print(f"[job] error BD: {e}")
+        logger.error(f"❌ Error actualizando preferencia de usuario {data.get('user_id')}: {e}")
         result["db_error"] = str(e)
 
     return result
@@ -182,7 +179,7 @@ async def job_edit_image(request: Dict[str, Any]) -> Dict[str, Any]:
                 font_final = ImageFont.truetype(
                     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_sz_text)
             except Exception as e:
-                print(f"[debug] font failed: {e}")
+                logger.warning(f"⚠️ Font fallo, usando fallback default: {e}")
                 font_final = ImageFont.load_default()
 
             # ── Paso 3: texto rotado sobre la línea en espacio 1x ───
@@ -225,7 +222,7 @@ async def job_edit_image(request: Dict[str, Any]) -> Dict[str, Any]:
                 'format':       'jpeg',
             }
         except Exception as e:
-            print(f"[job] Error Pillow dimensions: {e}")
+            logger.error(f"❌ Error Pillow dimensions: {e}")
             return {'success': False, 'error': str(e)}
 
     # Remove background: LLM
@@ -273,8 +270,9 @@ async def job_edit_image(request: Dict[str, Any]) -> Dict[str, Any]:
     except httpx.TimeoutException:
         return {'success': False, 'error': 'Timeout de 60 segundos excedido'}
     except Exception as e:
-        print(f"[job] Error en edit_image: {e}")
+        logger.error(f"❌ Error en edit_image: {e}")
         return {'success': False, 'error': str(e)}
+
 
 def _draw_arrowhead(draw: ImageDraw.ImageDraw, from_x: int, from_y: int,
                     to_x: int, to_y: int, size: int = 12, color: str = '#000000') -> None:
@@ -333,7 +331,7 @@ CRITICAL INSTRUCTIONS:
             img = Image.open(io.BytesIO(base64.b64decode(image_base64)))
             w, h = img.size
         except Exception as e:
-            print(f"[job] Error al abrir imagen: {e}")
+            logger.error(f"❌ Error al abrir imagen: {e}")
             w, h = 1000, 1000
         
         dims_text = []
@@ -394,7 +392,7 @@ def _extract_image_from_response(response_data: dict) -> str:
         
         return ""
     except Exception as e:
-        print(f"[job] Error extrayendo imagen: {e}")
+        logger.error(f"❌ Error extrayendo imagen: {e}")
         return ""
 
 

@@ -400,16 +400,54 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             logger.info(f"ℹ️ Gate 2.5: sin match en mensaje, modelo heredado='{modelo_resuelto}'")
 
         # ============================================
-        # 2.7 GATE — RESOLVER ALIAS DE PRODUCTO (solo normalización de mensaje,
-        # SIN persistir en state — a diferencia de modelo, producto no es
-        # contexto que se herede entre turnos)
+        # 2.7 GATE — RESOLVER ALIAS DE PRODUCTO
+        #
+        # A diferencia de modelo, producto NO es contexto de largo plazo:
+        # solo persiste UN turno extra, y únicamente cuando el turno
+        # anterior cerró con una aclaración pendiente del LLM selector
+        # (es_aclaracion=true). Fuera de ese caso puntual, sin match en
+        # el mensaje actual significa que no hay producto vigente.
+        #
+        # - Match en el mensaje actual: SIEMPRE reemplaza lo que hubiera
+        #   antes (hay producto nuevo, el ciclo anterior queda irrelevante).
+        # - Sin match: se conserva el producto en state SOLO SI quedó
+        #   marcado es_aclaracion=True en el turno anterior. En cualquier
+        #   otro caso, se limpia.
         # ============================================
         matches_producto = entity_resolver.resolver_productos_alias(message)
 
-        # Normaliza el alias de modelo (del mensaje actual o heredado del
-        # state) y luego los alias de producto detectados — en TODO lo que
-        # vaya a viajar hacia un LLM, para que ninguna llamada quede
-        # expuesta a jerga/alias crudo.
+        if matches_producto:
+            producto_resuelto = matches_producto[0]['producto']
+            alias_producto_usado = matches_producto[0]['alias']
+
+            state_manager.update_state(contact_id, {
+                'producto': producto_resuelto,
+                'alias_producto': alias_producto_usado,
+                'producto_candidatos': None,
+                'es_aclaracion': False,
+                'intentos_producto': 0,
+                'updated_at': datetime.now().isoformat(),
+            })
+            state = state_manager.get_state(contact_id)
+
+            logger.info(f"✅ Gate 2.7: producto '{producto_resuelto}' (alias '{alias_producto_usado}' normalizado en mensaje)")
+        else:
+            if state.get('producto') and state.get('es_aclaracion'):
+                alias_producto_usado = state.get('alias_producto')
+                logger.info(f"ℹ️ Gate 2.7: sin match en mensaje, producto heredado por aclaración pendiente='{state.get('producto')}'")
+            else:
+                alias_producto_usado = None
+                if state.get('producto'):
+                    state_manager.update_state(contact_id, {
+                        'producto': None,
+                        'alias_producto': None,
+                        'producto_candidatos': None,
+                        'es_aclaracion': False,
+                        'updated_at': datetime.now().isoformat(),
+                    })
+                    state = state_manager.get_state(contact_id)
+                logger.info("ℹ️ Gate 2.7: sin match en mensaje y sin aclaración pendiente, producto=None")
+
         message_normalizado = _normalizar_alias(message, alias_usado, modelo_resuelto)
         for m in matches_producto:
             message_normalizado = _normalizar_alias(message_normalizado, m['alias'], m['producto'])
@@ -467,6 +505,9 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             resolution={
                 'model_found': state.get('model_found', False),
                 'modelo': state.get('modelo'),
+                'producto': state.get('producto'),
+                'producto_candidatos': state.get('producto_candidatos'),
+                'es_aclaracion': state.get('es_aclaracion', False),
             },
         )
 

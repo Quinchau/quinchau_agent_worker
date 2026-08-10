@@ -14,6 +14,7 @@ from datetime import datetime
 from ..ghl import send_message_to_ghl
 from ..prompts import load_prompt
 from ..catalog_cache import catalog_cache
+from ..database import get_db_cursor  # Se importa el context manager con pool
 from .context import IntentContext, registrar
 
 logger = logging.getLogger(__name__)
@@ -140,8 +141,6 @@ def _redactar_respuesta_faq(ctx: IntentContext, faq_answer: str) -> str:
 
 
 def _log_faq_interaction(ctx: IntentContext, faq_id, confianza, razon, respuesta_final, resultado):
-    from ..database import get_db_connection
-
     query = """
         INSERT INTO faq_interactions
             (contact_id, mensaje, faq_id_seleccionado, confianza, razon_seleccion, respuesta_final, resultado)
@@ -158,18 +157,13 @@ def _log_faq_interaction(ctx: IntentContext, faq_id, confianza, razon, respuesta
         resultado,
     )
 
-    conn = None
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
+        # Se reemplaza la gestión manual por el context manager administrado
+        with get_db_cursor() as cursor:
             cursor.execute(query, params)
-        conn.commit()
         logger.info(f"📝 faq_interactions registrado: resultado={resultado}, faq_id={faq_id}")
     except Exception as e:
         logger.error(f"❌ Error insertando faq_interactions: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 
 def _derivar_sin_informacion(ctx: IntentContext) -> dict:

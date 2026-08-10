@@ -11,6 +11,8 @@ esa comprensión, seleccionar la herramienta correspondiente.
 HISTORIAL DE LA CONVERSACIÓN:
 {historial_texto}
 
+MODELO HEREDADO: {modelo}
+
 MENSAJE ACTUAL DEL USUARIO:
 "{mensaje}"
 
@@ -28,3 +30,7 @@ INSTRUCCIONES:
 4. Si el mensaje no tiene relación identificable con la conversación
    —ruido, símbolos sueltos, un tema completamente ajeno al negocio—
    usa sin_clasificar.
+5. Si el campo MODELO HEREDADO tiene un valor definido (distinto de
+   "no especificado"), usalo como dato confiable de qué modelo de moto
+   está vigente en la conversación — no dependas de encontrar ese
+   modelo mencionado como texto en el historial para confirmarlo.

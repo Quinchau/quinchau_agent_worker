@@ -4,7 +4,7 @@ import json
 import logging
 import requests
 from typing import List, Dict, Optional
-from .database import get_db_connection
+from .database import get_db_cursor  # Se importa el context manager del pool
 from .redis_queue import get_redis
 
 logger = logging.getLogger(__name__)
@@ -17,12 +17,16 @@ KEY_BLOQUEANTES = "catalog:bloqueantes"
 KEY_TERMINOS_PATTERNS = "catalog:terminos_patterns"
 KEY_HERRAMIENTAS = "catalog:herramientas"
 KEY_PRODUCTOS_MODELO = "catalog:productos_modelo:{modelo}"
+KEY_PRODUCTOS_TERMINO = "catalog:productos_termino:{termino}"
+KEY_PRODUCTOS_MODELO_Y_TERMINO = "catalog:productos_modelo_y_termino:{modelo}:{termino}"
 KEY_SYSTEM_FAQS = "catalog:system_faqs"
 
 # URL base del API Node.js (desde CATALOG_URL_ENDPOINT)
 CATALOG_URL_ENDPOINT = os.getenv("CATALOG_URL_ENDPOINT", "http://quinchau-api:3003/api/agent/catalog-url")
 # Derivar productos-por-modelo de la misma base (reemplaza último segmento)
 CATALOG_PRODUCTOS_MODELO_URL = CATALOG_URL_ENDPOINT.replace("catalog-url", "productos-por-modelo")
+# Endpoint dual específico/transversal — busqueda_producto_generica con modelo ya en contexto
+CATALOG_PRODUCTOS_MODELO_Y_TERMINO_URL = CATALOG_URL_ENDPOINT.replace("catalog-url", "productos-por-modelo-y-termino")
 NODE_AGENT_TIMEOUT = 5  # segundos
 
 # JSON Schema no tiene tipos nativos de fecha/hora: se mapean a string + format
@@ -47,7 +51,7 @@ EXCLUIR_DE_HERRAMIENTAS = set()
 class CatalogCache:
     def __init__(self):
         self.redis = get_redis()
-        self.db = get_db_connection()
+        # Se elimina self.db = get_db_connection() para evitar conexiones persistentes congeladas
 
     # ============================================
     # INTENCIONES
@@ -77,7 +81,8 @@ class CatalogCache:
         ORDER BY id
         """
         try:
-            with self.db.cursor() as cursor:
+            # Conexión tomada temporalmente del pool
+            with get_db_cursor() as cursor:
                 cursor.execute(query)
                 return cursor.fetchall()
         except Exception as e:
@@ -113,7 +118,8 @@ class CatalogCache:
         ORDER BY sort_order
         """
         try:
-            with self.db.cursor() as cursor:
+            # Conexión tomada temporalmente del pool
+            with get_db_cursor() as cursor:
                 cursor.execute(query)
                 return cursor.fetchall()
         except Exception as e:
@@ -163,7 +169,8 @@ class CatalogCache:
         """
 
         try:
-            with self.db.cursor() as cursor:
+            # Cada bloque interactúa con el pool garantizando transacciones atómicas
+            with get_db_cursor() as cursor:
                 cursor.execute(query_intenciones)
                 intenciones = cursor.fetchall()
         except Exception as e:
@@ -171,7 +178,7 @@ class CatalogCache:
             return []
 
         try:
-            with self.db.cursor() as cursor:
+            with get_db_cursor() as cursor:
                 cursor.execute(query_relaciones)
                 relaciones = cursor.fetchall()
         except Exception as e:
@@ -264,7 +271,7 @@ class CatalogCache:
         """
 
         try:
-            with self.db.cursor() as cursor:
+            with get_db_cursor() as cursor:
                 cursor.execute(query_terminos)
                 results_terminos = cursor.fetchall()
         except Exception as e:
@@ -272,7 +279,7 @@ class CatalogCache:
             results_terminos = []
 
         try:
-            with self.db.cursor() as cursor:
+            with get_db_cursor() as cursor:
                 cursor.execute(query_alias)
                 results_alias = cursor.fetchall()
         except Exception as e:
@@ -310,52 +317,76 @@ class CatalogCache:
         return all_patterns
 
     # ============================================
-    # PRODUCTOS POR MODELO (nuevo)
-    #    Redis (TTL corto, stock variable) → Node (fuente de verdad) → Redis
+    # PRODUCTOS POR MODELO — O POR TÉRMINO SI NO HAY MODELO
+    #     Redis (TTL corto, stock variable) → Node (fuente de verdad) → Redis
     # ============================================
 
-    def get_productos_por_modelo(self, modelo: str) -> List[Dict]:
+    def get_productos_por_modelo(self, modelo: Optional[str] = None, producto: Optional[str] = None) -> List[Dict]:
         """
         Catálogo completo de productos de un modelo (sin filtro de texto),
-        usado para poblar el enum del tool call.
+        usado para poblar el enum del tool call, y por busqueda_producto_modelo
+        para que el LLM razone semánticamente sobre TODO el catálogo del modelo.
+
+        Si `modelo` no viene pero sí `producto`, busca en su lugar por
+        término libre sobre la descripción del producto (ej. "caucho
+        90-90-18") — para el caso de productos que no se identifican por
+        modelo de moto sino por un atributo propio (medida, marca, etc.).
+        Cuando ambos vienen, `modelo` es el filtro primario (comportamiento
+        sin cambios); `producto` solo se usa cuando `modelo` está ausente.
+
+        NOTA: para busqueda_producto_generica CON modelo ya en contexto,
+        usar get_productos_modelo_y_termino en su lugar — este método NO
+        filtra por término cuando hay modelo, siempre trae el catálogo
+        completo (por diseño, para busqueda_producto_modelo).
 
         Retorna SIEMPRE una lista (vacía en caso de error), nunca None —
         así el resto del pipeline no necesita chequear None en cada uso.
         """
-        if not modelo:
+        if not modelo and not producto:
             return []
 
-        modelo_normalizado = modelo.lower().strip()
-        cache_key = KEY_PRODUCTOS_MODELO.format(modelo=modelo_normalizado)
+        if modelo:
+            cache_key = KEY_PRODUCTOS_MODELO.format(modelo=modelo.lower().strip())
+        else:
+            cache_key = KEY_PRODUCTOS_TERMINO.format(termino=producto.lower().strip())
 
         try:
             cached = self.redis.get(cache_key)
             if cached:
                 productos = json.loads(cached)
-                logger.info(f"📦 Cache hit productos de '{modelo}' ({len(productos)})")
+                logger.info(f"📦 Cache hit productos de '{modelo or producto}' ({len(productos)})")
                 return productos
         except Exception as e:
-            logger.warning(f"⚠️ Redis no disponible (productos por modelo): {e}")
-            return self._fetch_productos_por_modelo_backend(modelo)
+            logger.warning(f"⚠️ Redis no disponible (productos por modelo/término): {e}")
+            return self._fetch_productos_por_modelo_backend(modelo, producto)
 
-        productos = self._fetch_productos_por_modelo_backend(modelo)
+        productos = self._fetch_productos_por_modelo_backend(modelo, producto)
         try:
             self.redis.setex(cache_key, CACHE_TTL_PRODUCTOS, json.dumps(productos, default=str))
         except Exception as e:
-            logger.warning(f"⚠️ No se pudo escribir cache de productos por modelo: {e}")
+            logger.warning(f"⚠️ No se pudo escribir cache de productos por modelo/término: {e}")
         return productos
 
-    def _fetch_productos_por_modelo_backend(self, modelo: str) -> List[Dict]:
+    def _fetch_productos_por_modelo_backend(self, modelo: Optional[str], producto: Optional[str] = None) -> List[Dict]:
         """
         Llama al endpoint de Node (agent-resolver.service) que devuelve
-        TODOS los productos del modelo, sin filtro de texto.
+        TODOS los productos del modelo, sin filtro de texto — o, cuando
+        no hay modelo, todos los productos que matcheen `producto` como
+        término de búsqueda libre.
         """
-        # Usar CATALOG_PRODUCTOS_MODELO_URL que ya está definida al inicio del archivo
         url = CATALOG_PRODUCTOS_MODELO_URL
+        payload = {}
+        if modelo:
+            payload["identidad_modelo"] = modelo
+        if producto:
+            payload["producto"] = producto
+
+        etiqueta = modelo or producto
+
         try:
             response = requests.post(
                 url,
-                json={"identidad_modelo": modelo},
+                json=payload,
                 headers={"Content-Type": "application/json"},
                 timeout=NODE_AGENT_TIMEOUT,
             )
@@ -363,22 +394,118 @@ class CatalogCache:
             data = response.json()
 
             if not data.get("success"):
-                logger.warning(f"⚠️ Node respondió error para '{modelo}': {data.get('error')}")
+                logger.warning(f"⚠️ Node respondió error para '{etiqueta}': {data.get('error')}")
                 return []
 
             productos = data.get("data", {}).get("productos", [])
-            logger.info(f"✅ Catálogo de '{modelo}' obtenido de Node: {len(productos)} productos")
+            logger.info(f"✅ Catálogo de '{etiqueta}' obtenido de Node: {len(productos)} productos")
             return productos
 
         except requests.exceptions.Timeout:
-            logger.warning(f"⚠️ Timeout consultando Node (productos por modelo) para '{modelo}'")
+            logger.warning(f"⚠️ Timeout consultando Node (productos por modelo/término) para '{etiqueta}'")
             return []
         except requests.exceptions.ConnectionError:
-            logger.warning(f"⚠️ Error de conexión con Node (productos por modelo) para '{modelo}'")
+            logger.warning(f"⚠️ Error de conexión con Node (productos por modelo/término) para '{etiqueta}'")
             return []
         except Exception as e:
-            logger.error(f"❌ Error consultando Node (productos por modelo) para '{modelo}': {e}")
+            logger.error(f"❌ Error consultando Node (productos por modelo/término) para '{etiqueta}': {e}")
             return []
+
+    # ============================================
+    # PRODUCTOS POR MODELO + TÉRMINO (dual: específico + transversal)
+    #     Exclusivo de busqueda_producto_generica con modelo YA en contexto
+    #     Redis (TTL corto) → Node (endpoint dual) → Redis
+    # ============================================
+
+    def get_productos_modelo_y_termino(self, modelo: str, producto: str) -> Dict:
+        """
+        Usado exclusivamente por busqueda_producto_generica cuando ya hay
+        un modelo definido en el state de conversación Y el mensaje actual
+        trae además un término de producto (ej. "tienen baterías?" con
+        modelo=HJ125S ya seteado).
+
+        A diferencia de get_productos_por_modelo (catálogo completo sin
+        filtrar), este método SÍ filtra por término y devuelve DOS listas
+        ya resueltas por Node sin solapamiento de ids:
+
+        - 'especifico': productos del modelo que matchean el término.
+        - 'transversal': productos de TODO el catálogo que matchean el
+          término, excluyendo los ids ya presentes en 'especifico'.
+
+        Retorna SIEMPRE un dict con ambas listas (vacías en caso de
+        error), nunca None:
+            {'especifico': [...], 'transversal': [...]}
+        """
+        if not modelo or not producto:
+            return {'especifico': [], 'transversal': []}
+
+        cache_key = KEY_PRODUCTOS_MODELO_Y_TERMINO.format(
+            modelo=modelo.lower().strip(),
+            termino=producto.lower().strip(),
+        )
+
+        try:
+            cached = self.redis.get(cache_key)
+            if cached:
+                resultado = json.loads(cached)
+                logger.info(
+                    f"📦 Cache hit productos modelo+término '{modelo}'+'{producto}' "
+                    f"(especifico={len(resultado.get('especifico', []))}, "
+                    f"transversal={len(resultado.get('transversal', []))})"
+                )
+                return resultado
+        except Exception as e:
+            logger.warning(f"⚠️ Redis no disponible (productos modelo+término): {e}")
+            return self._fetch_productos_modelo_y_termino_backend(modelo, producto)
+
+        resultado = self._fetch_productos_modelo_y_termino_backend(modelo, producto)
+        try:
+            self.redis.setex(cache_key, CACHE_TTL_PRODUCTOS, json.dumps(resultado, default=str))
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo escribir cache de productos modelo+término: {e}")
+        return resultado
+
+    def _fetch_productos_modelo_y_termino_backend(self, modelo: str, producto: str) -> Dict:
+        """
+        Llama al endpoint dual de Node (productos-por-modelo-y-termino)
+        que devuelve 'especifico' y 'transversal' ya separados y sin
+        ids duplicados entre ambas listas.
+        """
+        try:
+            response = requests.post(
+                CATALOG_PRODUCTOS_MODELO_Y_TERMINO_URL,
+                json={"identidad_modelo": modelo, "producto": producto},
+                headers={"Content-Type": "application/json"},
+                timeout=NODE_AGENT_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if not data.get("success"):
+                logger.warning(
+                    f"⚠️ Node respondió error para modelo+término '{modelo}'+'{producto}': {data.get('error')}"
+                )
+                return {'especifico': [], 'transversal': []}
+
+            payload = data.get("data", {})
+            especifico = payload.get("especifico", [])
+            transversal = payload.get("transversal", [])
+
+            logger.info(
+                f"✅ Catálogo dual '{modelo}'+'{producto}' obtenido de Node: "
+                f"especifico={len(especifico)}, transversal={len(transversal)}"
+            )
+            return {'especifico': especifico, 'transversal': transversal}
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"⚠️ Timeout consultando Node (modelo+término) para '{modelo}'+'{producto}'")
+            return {'especifico': [], 'transversal': []}
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"⚠️ Error de conexión con Node (modelo+término) para '{modelo}'+'{producto}'")
+            return {'especifico': [], 'transversal': []}
+        except Exception as e:
+            logger.error(f"❌ Error consultando Node (modelo+término) para '{modelo}'+'{producto}': {e}")
+            return {'especifico': [], 'transversal': []}
 
 # ============================================
 # INSTANCIA GLOBAL PARA IMPORTACIÓN
