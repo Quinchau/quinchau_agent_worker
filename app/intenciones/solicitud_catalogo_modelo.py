@@ -93,7 +93,7 @@ def _responder_con_catalogo(ctx: IntentContext, modelo: str) -> dict:
 
     return {
         "success": True,
-        "response": mensajes,
+        "response": mensaje,
         "contact_id": ctx.contact_id,
         "intencion": ctx.intencion,
         "modelo_contexto": modelo,

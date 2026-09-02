@@ -44,6 +44,23 @@ FORMATO_EXTRA = {
     "time": {"format": "time"},
 }
 
+# Entidades válidas para el diccionario de términos/alias del clasificador.
+# NOTA: esto es lo que reemplaza al fallback 'no_clasificado' que existía
+# antes — cualquier fila de terminos_semanticos cuyo id_entidad no matchee
+# a 'modelo' o 'producto' queda FUERA por diseño del INNER JOIN, no entra
+# disfrazada de 'no_clasificado'. Casos históricos ya limpiados en BD:
+# id=30 ('ubicacion', entidad ajena — borrada), id=46 ('FR80') e
+# id=812 ('Tapa Frontal') (sin id_entidad — reclasificados).
+#
+# Se exporta para que otros módulos (ej. classifier_block_builder.py, como
+# cinturón de seguridad en código) filtren con el mismo criterio sin
+# duplicar el tuple. La query SQL de abajo usa los mismos valores en forma
+# literal (no parametrizada) por consistencia con el resto de las queries
+# de este archivo, que tampoco parametrizan — si se agrega/quita un tipo
+# de entidad válido, actualizar ambos lugares (esta constante y el WHERE
+# de query_terminos/query_alias).
+ENTIDADES_TERMINOS_VALIDAS = ('modelo', 'producto')
+
 # sin_clasificar SE INCLUYE como tool explícita (no se excluye).
 EXCLUIR_DE_HERRAMIENTAS = set()
 
@@ -81,7 +98,6 @@ class CatalogCache:
         ORDER BY id
         """
         try:
-            # Conexión tomada temporalmente del pool
             with get_db_cursor() as cursor:
                 cursor.execute(query)
                 return cursor.fetchall()
@@ -118,7 +134,6 @@ class CatalogCache:
         ORDER BY sort_order
         """
         try:
-            # Conexión tomada temporalmente del pool
             with get_db_cursor() as cursor:
                 cursor.execute(query)
                 return cursor.fetchall()
@@ -169,7 +184,6 @@ class CatalogCache:
         """
 
         try:
-            # Cada bloque interactúa con el pool garantizando transacciones atómicas
             with get_db_cursor() as cursor:
                 cursor.execute(query_intenciones)
                 intenciones = cursor.fetchall()
@@ -226,6 +240,21 @@ class CatalogCache:
 
     # ============================================
     # TÉRMINOS + ALIAS (merge + dedup + sort ya resuelto)
+    #
+    # FIX: antes usaba LEFT JOIN con fallback a 'no_clasificado', lo que
+    # dejaba entrar filas de terminos_semanticos con id_entidad ajeno o
+    # NULL (casos reales detectados: 'ubicacion', 'FR80', 'Tapa Frontal').
+    # Ahora es INNER JOIN + WHERE e.nombre IN ('modelo','producto') —
+    # el filtro vive en el origen, no depende de que cada consumidor lo
+    # aplique por su cuenta.
+    #
+    # ORDER BY también cambia: antes 'LENGTH(ta.alias) DESC' sin
+    # desempate, orden no garantizado como estable entre ejecuciones en
+    # MySQL 5.7 con longitudes iguales. Ahora 'ts.termino, ta.alias' —
+    # determinístico. Esto importa para classifier_block_builder: si el
+    # bloque estático se reconstruye y el orden interno cambia sin que
+    # los datos hayan cambiado, el texto final no es byte-idéntico y se
+    # invalida el prompt caching del proveedor sin motivo real.
     # ============================================
 
     def get_terminos_patterns(self):
@@ -253,8 +282,10 @@ class CatalogCache:
             e.nombre as entidad_nombre,
             ts.termino as pattern
         FROM terminos_semanticos ts
-        LEFT JOIN entidades e ON ts.id_entidad = e.id
+        INNER JOIN entidades e ON ts.id_entidad = e.id
         WHERE ts.activo = 1
+          AND e.nombre IN ('modelo', 'producto')
+        ORDER BY ts.termino
         """
         query_alias = """
         SELECT
@@ -265,9 +296,10 @@ class CatalogCache:
             ta.alias as pattern
         FROM terminos_semanticos ts
         JOIN terminos_alias ta ON ts.id = ta.id_termino
-        LEFT JOIN entidades e ON ts.id_entidad = e.id
+        INNER JOIN entidades e ON ts.id_entidad = e.id
         WHERE ts.activo = 1
-        ORDER BY LENGTH(ta.alias) DESC
+          AND e.nombre IN ('modelo', 'producto')
+        ORDER BY ts.termino, ta.alias
         """
 
         try:
@@ -289,6 +321,12 @@ class CatalogCache:
         all_patterns = []
         seen_patterns = set()
 
+        # NOTA: se dejó de ordenar por longitud descendente acá. El orden
+        # de salida final relevante para consumo (compacto/enum) lo decide
+        # classifier_block_builder, no esta capa — acá solo importa que
+        # sea determinístico, no un orden "óptimo" para ningún consumidor
+        # en particular (ya no hay Gate por regex que dependa de probar
+        # primero los patterns más largos).
         for row in results_terminos:
             pattern = row['pattern'].lower()
             if pattern not in seen_patterns:
@@ -297,7 +335,7 @@ class CatalogCache:
                     'termino_id': row['termino_id'],
                     'termino': row['termino'],
                     'id_entidad': row['id_entidad'],
-                    'entidad_nombre': row['entidad_nombre'] or 'no_clasificado',
+                    'entidad_nombre': row['entidad_nombre'],
                     'pattern': pattern
                 })
 
@@ -309,12 +347,37 @@ class CatalogCache:
                     'termino_id': row['termino_id'],
                     'termino': row['termino'],
                     'id_entidad': row['id_entidad'],
-                    'entidad_nombre': row['entidad_nombre'] or 'no_clasificado',
+                    'entidad_nombre': row['entidad_nombre'],
                     'pattern': pattern
                 })
 
-        all_patterns.sort(key=lambda x: len(x['pattern']), reverse=True)
+        all_patterns.sort(key=lambda x: (x['termino'].lower(), x['pattern']))
         return all_patterns
+
+    def get_terminos_set(self) -> Dict[str, str]:
+        """
+        Dict {texto_normalizado: termino_canonico} para validación
+        exact-match O(1) contra el diccionario modelo/producto.
+
+        Fuente para _validar_termino() en tasks.py — reemplaza el
+        matching aproximado (_text_matches/_calculate_priority) que
+        hacía el Gate viejo: el trabajo semántico ya lo hizo el LLM
+        clasificador, esto es solo la red de seguridad de que el string
+        que devolvió existe de verdad en el catálogo.
+
+        No se cachea aparte: recalcula sobre datos ya cacheados por
+        get_terminos_patterns() (~600 items), transformación in-memory
+        despreciable en costo.
+        """
+        # Import diferido para evitar import circular
+        # (entity_resolver importa catalog_cache).
+        from .entity_resolver import entity_resolver
+
+        patterns = self.get_terminos_patterns()
+        return {
+            entity_resolver.normalize_text(p['pattern']): p['termino']
+            for p in patterns
+        }
 
     # ============================================
     # PRODUCTOS POR MODELO — O POR TÉRMINO SI NO HAY MODELO
@@ -506,6 +569,7 @@ class CatalogCache:
         except Exception as e:
             logger.error(f"❌ Error consultando Node (modelo+término) para '{modelo}'+'{producto}': {e}")
             return {'especifico': [], 'transversal': []}
+
 
 # ============================================
 # INSTANCIA GLOBAL PARA IMPORTACIÓN

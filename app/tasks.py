@@ -1,6 +1,6 @@
+# app/tasks.py
 import os
 import json
-import copy
 import re
 import logging
 import io
@@ -8,13 +8,13 @@ import httpx
 from .ghl import send_message_to_ghl
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+from .classifier import clasificar
 
 from openai import OpenAI
 
 from .redis_queue import get_queue, QUEUE_HIGH, QUEUE_AI, get_redis
 from .jobs import job_classify_user_preference, job_general_chat
 from .agent_state import AgentStateManager
-from .entity_resolver import entity_resolver
 from .catalog_cache import catalog_cache
 from .prompts import load_prompt
 from .intenciones import IntentContext, obtener_manejador
@@ -29,7 +29,6 @@ SYNC_MODE = os.getenv("SYNC_MODE", "false").lower() == "true"
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
 INTENCION_FALLBACK = "sin_clasificar"
-# VALOR_SIN_MATCH_PRODUCTO = "ninguno_coincide"
 
 
 # ============================================
@@ -56,48 +55,8 @@ async def classify_user_preference_task(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================
-# HELPERS DEL NUEVO FLUJO
+# HELPERS
 # ============================================
-
-def _inyectar_razonamiento(herramientas: List[Dict]) -> List[Dict]:
-    """
-    Agrega un campo 'razonamiento' obligatorio, como primera propiedad,
-    al schema de cada tool — para forzar que el modelo articule el tema
-    real del mensaje antes de comprometerse con la selección de función.
-
-    Con tool_choice="required", el modelo solo puede responder con
-    argumentos de función (no hay canal de texto libre). Sin este campo,
-    el modelo salta directo de "hay un producto referenciado" a elegir
-    intencion_compra, sin distinguir si la pregunta es sobre el producto
-    o sobre el proceso de compra (pago, envío, etc.) que solo lo
-    menciona de forma incidental.
-    """
-    herramientas_parcheadas = copy.deepcopy(herramientas)
-
-    for tool in herramientas_parcheadas:
-        params = tool['function']['parameters']
-        propiedades_originales = params.get('properties', {})
-
-        params['properties'] = {
-            "razonamiento": {
-                "type": "string",
-                "description": (
-                    "Antes de completar el resto de los campos, explica en "
-                    "una frase: (1) a qué se refiere el mensaje actual dado "
-                    "el historial de la conversación, y (2) cuál es el tema "
-                    "real de la pregunta — ¿es sobre el producto en sí "
-                    "(disponibilidad, precio, variante), o sobre el proceso "
-                    "de compra (pago, envío, horario, garantía)? Sé "
-                    "explícito sobre esta distinción incluso si un producto "
-                    "está implícito o referenciado en la oración (ej. por "
-                    "un pronombre como 'la'/'lo')."
-                ),
-            },
-            **propiedades_originales,
-        }
-        params['required'] = ["razonamiento"] + params.get('required', [])
-
-    return herramientas_parcheadas
 
 _ACENTOS = {
     'a': 'aáàâã', 'e': 'eéèê', 'i': 'iíìî',
@@ -117,87 +76,30 @@ def _patron_insensible_a_acentos(palabra: str) -> str:
     return ''.join(partes)
 
 
-def _normalizar_alias(texto: str, alias: Optional[str], modelo: str) -> str:
-    if not texto or not alias:
-        return texto
-
-    patron = r'\b' + _patron_insensible_a_acentos(alias) + r'\b'
-    return re.sub(patron, modelo, texto, flags=re.IGNORECASE)
-
-
-def _llamar_llm_tool_calling(
-    client: OpenAI,
-    message: str,
-    first_name: str,
-    state: Dict,
-    historial_texto: str,
-    herramientas: List[Dict],
-) -> Dict[str, Any]:
+def _validar_termino(texto: Optional[str], tipo: str) -> Optional[str]:
     """
-    Encapsula una llamada de tool-calling. Se usa tanto para la primera
-    pasada como para la segunda (CASO B) — mismo prompt, mismo historial,
-    la única diferencia entre llamadas es qué `herramientas` se le pasan
-    (con o sin enum de producto poblado).
+    Validación exact-match O(1) del término devuelto por el clasificador
+    contra el set de términos canónicos del catálogo.
+
+    'tipo' es 'modelo' o 'producto' — solo se usa para filtrar en el set
+    (get_terminos_set() devuelve ambos tipos mezclados; el término canónico
+    al que se mapea ya implica el tipo correcto).
+
+    Devuelve el término canónico si matchea, None si no. No hace matching
+    aproximado: el trabajo semántico ya lo hizo el LLM; esto es solo la
+    red de seguridad de que el string que devolvió existe en el catálogo
+    actual.
     """
-    herramientas_texto = ""
-    for t in herramientas:
-        nombre = t['function']['name']
-        descripcion = t['function'].get('description', '')
-        herramientas_texto += f"- {nombre}: {descripcion}\n"
+    if not texto:
+        return None
 
-    system_prompt = load_prompt(
-        "prompt_seleccion_herramienta",
-        nombre_cliente=first_name,
-        modelo=state.get('modelo', 'no especificado'),
-        intencion=state.get('ultima_intencion', 'ninguna'),
-        historial_texto=historial_texto,
-        mensaje=message,
-        herramientas_disponibles=herramientas_texto,
-    )
+    from .entity_resolver import entity_resolver
+    from .catalog_cache import catalog_cache
 
-    logger.info("📝 PROMPT SELECCIÓN HERRAMIENTA (COMPLETO):")
-    logger.info(system_prompt)
-    logger.info(f"📝 MENSAJE USUARIO: {message}")
-    logger.info(f"📝 TOOLS DISPONIBLES: {[t['function']['name'] for t in herramientas]}")
+    terminos_set = catalog_cache.get_terminos_set()
+    normalizado = entity_resolver.normalize_text(texto)
 
-    tool_response = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message},
-        ],
-        tools=herramientas,
-        tool_choice="required",
-        temperature=0.0,
-    )
-
-    msg = tool_response.choices[0].message
-    tool_calls = msg.tool_calls or []
-
-    if tool_calls:
-        primera = tool_calls[0]
-        intencion = primera.function.name
-        try:
-            entidades_detectadas = json.loads(primera.function.arguments)
-        except json.JSONDecodeError:
-            entidades_detectadas = {}
-        razonamiento_modelo = entidades_detectadas.pop('razonamiento', '')
-        razon = f"Tool seleccionada por el modelo: {intencion} | Razonamiento: {razonamiento_modelo}"
-    else:
-        intencion = INTENCION_FALLBACK
-        entidades_detectadas = {}
-        razon = "El modelo no seleccionó ninguna herramienta"
-
-    logger.info(f"🎯 Herramienta seleccionada: {intencion}")
-    logger.info(f"🔍 Entidades LLM: {entidades_detectadas}")
-    logger.info(f"   Razón: {razon}")
-
-    return {
-        "intencion": intencion,
-        "entidades_detectadas": entidades_detectadas,
-        "razon": razon,
-        "tool_calls": tool_calls,
-    }
+    return terminos_set.get(normalizado)
 
 
 # ============================================
@@ -245,13 +147,19 @@ def _transcribir_audio(url_audio: str, client: OpenAI) -> Optional[str]:
 
 
 def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Procesa el mensaje de GHL:
-    FLUJO: Transcripción de audio (si aplica) → Gate 2.5 (modelo, solo
-    contexto) → Gate 2.6 (alias de producto) → LLM tool-calling (una sola
-    pasada, sin enum de producto) → Handler (cada intención resuelve su
-    propia lógica de catálogo/producto si la necesita).
     """
+    Procesa el mensaje de GHL.
 
+    FLUJO:
+      1. Datos del usuario
+      1.5 Cliente OpenAI
+      1.6 Gate — transcripción de audio
+      2. Estado en Redis
+      2.5 Gate — imagen recibida (deriva sin clasificar)
+      2.6 Clasificador unificado (intención + modelo + producto)
+      3. Despacho al handler
+      4. LLM genérico (fallback)
+    """
     try:
         # ============================================
         # 1. DATOS DEL USUARIO
@@ -273,7 +181,7 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
 
         # ============================================
         # 1.5 CLIENTE OPENAI (se crea temprano: lo necesita tanto la
-        # transcripción de audio como el resto del pipeline más abajo)
+        # transcripción de audio como los handlers más abajo)
         # ============================================
         client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
@@ -281,8 +189,7 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         # ============================================
-        # 1.6 GATE — TRANSCRIPCIÓN DE NOTA DE VOZ (si el mensaje no trajo
-        # texto real pero sí un adjunto de audio en customData)
+        # 1.6 GATE — TRANSCRIPCIÓN DE NOTA DE VOZ
         # ============================================
         custom_data = task_data.get('custom_data', {}) or {}
         attachment_url = custom_data.get('attachments') or ''
@@ -375,133 +282,106 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         # ============================================
-        # 2.6 GATE — RESOLVER MODELO (solo contexto, sin catálogo)
-        # ============================================
-        resultado_gate = entity_resolver.resolver_modelo(message)
-
-        if resultado_gate:
-            modelo_resuelto = resultado_gate['modelo']
-            alias_usado = resultado_gate['alias']
-
-            state_manager.update_state(contact_id, {
-                'modelo': modelo_resuelto,
-                'alias_modelo': alias_usado,
-                'ultimo_modelo': modelo_resuelto,
-                'model_found': True,
-                'intentos_resolucion': 0,
-                'updated_at': datetime.now().isoformat(),
-            })
-            state = state_manager.get_state(contact_id)
-
-            logger.info(f"✅ Gate 2.5: modelo '{modelo_resuelto}' (alias '{alias_usado}' normalizado en mensaje)")
-        else:
-            modelo_resuelto = state.get('modelo')
-            alias_usado = state.get('alias_modelo')
-            logger.info(f"ℹ️ Gate 2.5: sin match en mensaje, modelo heredado='{modelo_resuelto}'")
-
-        # ============================================
-        # 2.7 GATE — RESOLVER ALIAS DE PRODUCTO
+        # 2.6 CLASIFICADOR UNIFICADO — intención + modelo + producto
         #
-        # A diferencia de modelo, producto NO es contexto de largo plazo:
-        # solo persiste UN turno extra, y únicamente cuando el turno
-        # anterior cerró con una aclaración pendiente del LLM selector
-        # (es_aclaracion=true). Fuera de ese caso puntual, sin match en
-        # el mensaje actual significa que no hay producto vigente.
+        # Reemplaza Gate 2.5 (resolver_modelo) y Gate 2.7
+        # (resolver_productos_alias). El LLM clasificador resuelve los
+        # tres en una sola pasada contra el diccionario de términos
+        # cacheado (classifier:static_block). La validación
+        # determinística (exact-match normalizado) ocurre acá mismo,
+        # en _validar_termino(), antes de persistir en state.
         #
-        # - Match en el mensaje actual: SIEMPRE reemplaza lo que hubiera
-        #   antes (hay producto nuevo, el ciclo anterior queda irrelevante).
-        # - Sin match: se conserva el producto en state SOLO SI quedó
-        #   marcado es_aclaracion=True en el turno anterior. En cualquier
-        #   otro caso, se limpia.
+        # NOTA: message y historial_texto ya NO se normalizan (alias →
+        # término canónico) antes de esta llamada. El clasificador
+        # resuelve alias semánticamente en el texto original; la
+        # normalización previa era un requisito del Gate por regex, no
+        # del LLM.
         # ============================================
-        matches_producto = entity_resolver.resolver_productos_alias(message)
-
-        if matches_producto:
-            producto_resuelto = matches_producto[0]['producto']
-            alias_producto_usado = matches_producto[0]['alias']
-
-            state_manager.update_state(contact_id, {
-                'producto': producto_resuelto,
-                'alias_producto': alias_producto_usado,
-                'producto_candidatos': None,
-                'es_aclaracion': False,
-                'intentos_producto': 0,
-                'updated_at': datetime.now().isoformat(),
-            })
-            state = state_manager.get_state(contact_id)
-
-            logger.info(f"✅ Gate 2.7: producto '{producto_resuelto}' (alias '{alias_producto_usado}' normalizado en mensaje)")
-        else:
-            if state.get('producto') and state.get('es_aclaracion'):
-                alias_producto_usado = state.get('alias_producto')
-                logger.info(f"ℹ️ Gate 2.7: sin match en mensaje, producto heredado por aclaración pendiente='{state.get('producto')}'")
-            else:
-                alias_producto_usado = None
-                if state.get('producto'):
-                    state_manager.update_state(contact_id, {
-                        'producto': None,
-                        'alias_producto': None,
-                        'producto_candidatos': None,
-                        'es_aclaracion': False,
-                        'updated_at': datetime.now().isoformat(),
-                    })
-                    state = state_manager.get_state(contact_id)
-                logger.info("ℹ️ Gate 2.7: sin match en mensaje y sin aclaración pendiente, producto=None")
-
-        message_normalizado = _normalizar_alias(message, alias_usado, modelo_resuelto)
-        for m in matches_producto:
-            message_normalizado = _normalizar_alias(message_normalizado, m['alias'], m['producto'])
-
-        historial_normalizado = _normalizar_alias(historial_texto, alias_usado, modelo_resuelto)
-
-        # ============================================
-        # 4. TOOLS BASE (el cliente OpenAI ya se creó en el paso 1.5)
-        # ============================================
-        herramientas_base = catalog_cache.get_herramientas()
-        herramientas_base = _inyectar_razonamiento(herramientas_base)
-
-        # ============================================
-        # 5. LLAMADA AL LLM — solo clasifica intención, sin enum de producto
-        # ============================================
-        resultado_llm = _llamar_llm_tool_calling(
-            client, message_normalizado, first_name, state, historial_normalizado, herramientas_base
+        resultado_clasificador = clasificar(
+            mensaje=message,
+            historial_texto=historial_texto,
+            modelo_heredado=state.get('modelo'),
         )
 
-        intencion = resultado_llm['intencion']
-        entidades_detectadas = resultado_llm['entidades_detectadas']
-        razon = resultado_llm['razon']
-        tool_calls = resultado_llm['tool_calls']
+        if resultado_clasificador.get('error'):
+            logger.warning(
+                f"⚠️ Clasificador con error: {resultado_clasificador['error']} "
+                f"— conservando estado previo, despachando con intención 'sin_clasificar'"
+            )
 
-        # ============================================
-        # 6. PERSISTENCIA DE INTENCIÓN
-        # ============================================
-        intencion_anterior = state.get('ultima_intencion')
-        if intencion_anterior and intencion_anterior != intencion:
-            logger.info(f"🔄 CAMBIO DE INTENCIÓN: '{intencion_anterior}' → '{intencion}'")
+        intencion_detectada = resultado_clasificador.get('intencion', 'sin_clasificar')
+
+        # ── Validar modelo ────────────────────────────────────────────
+        # El LLM devuelve el nombre canónico (ya viene del enum), pero
+        # _validar_termino hace el exact-match final como red de
+        # seguridad: si el modelo no existe en el catálogo actual
+        # (catálogo cambió entre el rebuild del bloque estático y ahora),
+        # lo descarta en vez de persistir un valor huérfano.
+        modelo_clasificado = _validar_termino(
+            resultado_clasificador.get('modelo'),
+            tipo='modelo',
+        )
+
+        # ── Validar productos ─────────────────────────────────────────
+        # producto llega como lista de strings libres (sin enum en el
+        # schema). Cada ítem se valida por separado; los que no matcheen
+        # exacto contra el catálogo se descartan silenciosamente (se
+        # registra en log para alimentar la cola de no-resueltos, §7).
+        productos_raw = resultado_clasificador.get('producto', [])
+        productos_validados = []
+        for p in productos_raw:
+            validado = _validar_termino(p, tipo='producto')
+            if validado:
+                productos_validados.append(validado)
+            else:
+                logger.info(
+                    f"🔎 Término de producto no resuelto (para cola de revisión): "
+                    f"'{p}' | mensaje='{message[:60]}'"
+                )
+
+        # ── Persistir en state ────────────────────────────────────────
+        # Se eliminan alias_modelo, alias_producto, intentos_resolucion,
+        # intentos_producto — esos campos eran exclusivos del Gate viejo.
+        # es_aclaracion se mantiene pero lo setea el handler, no acá.
+        modelo_vigente = modelo_clasificado or state.get('modelo')
 
         state_manager.update_state(contact_id, {
-            'ultima_intencion': intencion,
+            'modelo': modelo_vigente,
+            'model_found': modelo_vigente is not None,
+            'producto': productos_validados,
+            'product_found': bool(productos_validados),
+            'ultima_intencion': intencion_detectada,
             'updated_at': datetime.now().isoformat(),
         })
         state = state_manager.get_state(contact_id)
 
+        logger.info(
+            f"✅ Clasificador | intención={intencion_detectada} | "
+            f"modelo={modelo_vigente} | productos={productos_validados} | "
+            f"contacto={first_name}"
+        )
+
         # ============================================
-        # 7. DESPACHO AL MANEJADOR
+        # 3. DESPACHO AL HANDLER
         # ============================================
+        intencion_anterior = state.get('ultima_intencion')
+        if intencion_anterior and intencion_anterior != intencion_detectada:
+            logger.info(f"🔄 CAMBIO DE INTENCIÓN: '{intencion_anterior}' → '{intencion_detectada}'")
+
         ctx = IntentContext(
-            message=message_normalizado,
+            message=message,
             contact_id=contact_id,
             channel=channel,
             first_name=first_name,
             last_name=last_name,
-            intencion=intencion,
-            confianza=1.0 if tool_calls else 0.0,
-            entidades_detectadas=entidades_detectadas,
-            razon=razon,
+            intencion=intencion_detectada,
+            confianza=1.0 if not resultado_clasificador.get('error') else 0.0,
+            entidades_detectadas=resultado_clasificador.get('entidades_extraidas', {}),
+            razon=f"Clasificador unificado | error={resultado_clasificador.get('error')}",
             state=state,
             state_manager=state_manager,
             client=client,
-            historial_texto=historial_normalizado,
+            historial_texto=historial_texto,
             resolution={
                 'model_found': state.get('model_found', False),
                 'modelo': state.get('modelo'),
@@ -511,13 +391,13 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
 
-        manejador = obtener_manejador(intencion)
+        manejador = obtener_manejador(intencion_detectada)
 
         if manejador:
             resultado_manejador = manejador(ctx)
 
             if resultado_manejador and resultado_manejador.get('tool_output'):
-                logger.info(f"🔄 Inyección de prompt detectada para: {intencion}")
+                logger.info(f"🔄 Inyección de prompt detectada para: {intencion_detectada}")
                 try:
                     from app.intenciones.inyection_prompt_from_tool import inyectar_y_generar
 
@@ -534,20 +414,20 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
 
                     state_manager.update_state(contact_id, {
                         'ultima_respuesta': respuesta,
-                        f'ultima_respuesta_{intencion}': datetime.now().isoformat(),
+                        f'ultima_respuesta_{intencion_detectada}': datetime.now().isoformat(),
                         'tool_output_usado': True,
                         'respuesta_generada_por_llm': True,
                         'esperando_confirmacion': False,
                         'esperando_respuesta': False,
                     })
 
-                    logger.info(f"✅ Respuesta generada y enviada para {intencion}")
+                    logger.info(f"✅ Respuesta generada y enviada para {intencion_detectada}")
 
                     return {
                         "success": True,
                         "response": respuesta,
                         "contact_id": contact_id,
-                        "intencion": intencion,
+                        "intencion": intencion_detectada,
                         "tool_output_usado": True,
                         "processed_at": datetime.now().isoformat(),
                     }
@@ -556,8 +436,7 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                     logger.error(f"❌ Error en flujo de inyección: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
-                    
-                    # Intentar usar el resultado tradicional del manejador como fallback
+
                     if resultado_manejador is not None and resultado_manejador.get('response'):
                         logger.info("ℹ️ Fallback al resultado tradicional del manejador")
                         state_manager.update_state(contact_id, {
@@ -566,20 +445,19 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                         })
                         return resultado_manejador
                     else:
-                        # Si no hay respuesta del manejador, enviar mensaje genérico de error
                         mensaje_error = "Lo siento, tuve un problema procesando tu mensaje. ¿Podrías intentarlo de nuevo?"
                         send_message_to_ghl(contact_id, mensaje_error, channel)
                         return {
                             "success": True,
                             "response": mensaje_error,
                             "contact_id": contact_id,
-                            "intencion": intencion,
+                            "intencion": intencion_detectada,
                             "error": True,
                             "processed_at": datetime.now().isoformat(),
                         }
 
             if resultado_manejador is not None:
-                logger.info(f"ℹ️ Flujo tradicional para: {intencion}")
+                logger.info(f"ℹ️ Flujo tradicional para: {intencion_detectada}")
                 state_manager.update_state(contact_id, {
                     'esperando_confirmacion': False,
                     'esperando_respuesta': False,
@@ -587,10 +465,10 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
                 return resultado_manejador
 
         else:
-            logger.info(f"ℹ️ Intención '{intencion}' no tiene manejador específico")
+            logger.info(f"ℹ️ Intención '{intencion_detectada}' no tiene manejador específico")
 
         # ============================================
-        # 8. LLM GENÉRICO (FALLBACK)
+        # 4. LLM GENÉRICO (FALLBACK)
         # ============================================
         resultado_final = generico.handle(ctx)
 
@@ -616,6 +494,7 @@ def process_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
         logger.error(traceback.format_exc())
         raise
 
+
 def enqueue_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
     queue = get_queue(QUEUE_AI)
 
@@ -637,7 +516,6 @@ def enqueue_ghl_message(task_data: Dict[str, Any]) -> Dict[str, Any]:
 
 TASKS = {
     "classify_user_preference": classify_user_preference_task,
-    # "chat": general_chat_task,
     "process_ghl_message": process_ghl_message,
     "enqueue_ghl_message": enqueue_ghl_message,
 }

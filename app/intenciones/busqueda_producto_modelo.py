@@ -1,46 +1,39 @@
+# app/intenciones/busqueda_producto_modelo.py
 """
 Handler para la intención busqueda_producto_modelo.
 
 Se activa cuando el MENSAJE ACTUAL del cliente nombra o cambia un
 modelo/categoría. La selección de esta tool YA ES la señal semántica
 de que el cliente está definiendo/redefiniendo el modelo — esa
-distinción solo puede hacerla el LLM clasificador, no Gate 2.5 (que
-solo hace matching por alias contra un diccionario conocido y no puede
-distinguir "modelo mal escrito" de "no se mencionó ningún modelo").
+distinción solo puede hacerla el LLM clasificador, no un matching
+léxico por alias contra un diccionario conocido.
 
 REGLAS DE ESTADO (el modelo es el contexto ACTUAL, no hay histórico):
-- Si el modelo mencionado resuelve: se actualiza 'modelo' y
-  'alias_modelo', pisando lo que hubiera antes (aunque el cliente
-  venía hablando de otro modelo — es un cambio de tema legítimo,
-  como pasaría entre dos personas conversando: ahora hablamos de A,
-  no de B).
-- Si NO resuelve: se limpia el contexto de modelo por completo
-  (modelo=None, alias_modelo=None). NUNCA se hereda el modelo anterior
-  para esta búsqueda ni para turnos siguientes — el cliente rompió el
-  contexto previo al intentar nombrar uno nuevo, y ese contexto no se
-  restaura solo porque no pudimos resolverlo.
-- No existe 'ultimo_modelo' ni contador de intentos en el estado. El
-  criterio de "¿ya le pedí aclaración de modelo antes?" lo resuelve un
-  LLM leyendo el historial completo — igual que un humano recordaría
-  la conversación, no contando intentos.
+- El modelo vigente llega ya resuelto y validado en ctx.state['modelo'],
+  escrito por el clasificador unificado en tasks.py. Este handler no
+  resuelve modelo por su cuenta.
+- Si ctx.state['modelo'] es None: el clasificador no pudo identificar
+  un modelo en este turno. Se delega al LLM la decisión de pedir
+  aclaración o derivar a humano, leyendo el historial completo.
+- No existe 'ultimo_modelo' ni contador de intentos para modelo en el
+  estado. El criterio de "¿ya le pedí aclaración antes?" lo resuelve
+  un LLM leyendo el historial — igual que un humano recordaría la
+  conversación, no contando intentos.
 
 Una vez resuelto el modelo, se mantiene el patrón que ya funcionaba:
 se entrega al LLM de catálogo TODA la lista de productos de ese
 modelo y es él quien resuelve selección, aclaración o fallback.
 
-RESOLUCIÓN DE PRODUCTO: 'producto' NO se extrae del dict libre del
-clasificador de intención (ctx.entidades_detectadas) — esa fuente no
-está anclada a catálogo y puede traer atributos (medida, color, marca)
-en lugar de un nombre real de producto. La única fuente válida es
-ctx.resolution['producto'], resuelto enteramente por Gate 2.7
-(entity_resolver, en tasks.py) por match directo o heredado.
+RESOLUCIÓN DE PRODUCTO: 'producto' llega ya resuelto y validado en
+ctx.state['producto'] (lista canónica), escrito por el clasificador
+unificado en tasks.py. Este handler nunca resuelve producto por su
+cuenta ni lo lee de ctx.entidades_detectadas.
 
-CICLO DE VIDA DE 'producto' EN EL STATE: es responsabilidad EXCLUSIVA
-del Gate (tasks.py) — este handler nunca setea ni limpia 'producto'
-directamente. La única señal que aporta al ciclo es la bandera
-'es_aclaracion' (True mientras el turno termina en una pregunta
-abierta, False cuando se cierra con un resultado). El Gate del turno
-siguiente lee esa bandera para decidir si conserva o limpia 'producto'.
+CICLO DE VIDA DE 'producto' EN EL STATE: la bandera 'es_aclaracion'
+(True mientras el turno termina en una pregunta abierta, False cuando
+se cierra con un resultado) es la única señal que aporta este handler
+al ciclo de vida de producto. El clasificador del turno siguiente lee
+el historial completo para inferir si el producto sigue vigente.
 """
 import json
 import logging
@@ -49,7 +42,6 @@ from typing import Dict, List, Optional
 
 from ..ghl import send_message_to_ghl, send_multiple_messages
 from ..catalog_cache import catalog_cache
-from ..entity_resolver import entity_resolver
 from ..prompts import load_prompt
 from .catalogo import get_catalog_url_for_model
 from .context import IntentContext, registrar
@@ -64,33 +56,20 @@ def handle(ctx: IntentContext) -> Optional[dict]:
     logger.info("🔍 Procesando consulta de catálogo — cliente define/cambia modelo en este mensaje")
 
     # ============================================
-    # 1. RESOLVER MODELO — siempre, nunca heredar
+    # 1. LEER MODELO YA RESUELTO — nunca resolver acá
+    #
+    # El clasificador unificado (tasks.py) ya resolvió y validó el
+    # modelo contra el catálogo antes de despachar a este handler.
+    # Si es None, el clasificador no pudo identificarlo en este turno.
     # ============================================
-    texto_modelo_llm = ctx.entidades_detectadas.get('modelo', '')
-    resultado_resolucion = entity_resolver.resolver_modelo(texto_modelo_llm) if texto_modelo_llm else None
+    modelo = ctx.state.get('modelo')
 
-    if resultado_resolucion:
-        modelo = resultado_resolucion['modelo']
-        ctx.state_manager.update_state(ctx.contact_id, {
-            'modelo': modelo,
-            'alias_modelo': resultado_resolucion['alias'],
-            'model_found': True,
-            'updated_at': datetime.now().isoformat(),
-        })
-        logger.info(f"✅ Modelo resuelto: '{modelo}' (texto detectado: '{texto_modelo_llm}')")
-
-    else:
-        # El cliente intentó nombrar un modelo/categoría y no matcheó con
-        # nada conocido. Limpiamos el contexto de modelo por completo —
-        # el heredado ya no es válido, el cliente rompió ese contexto.
-        logger.warning(f"⚠️ Modelo mencionado '{texto_modelo_llm}' no resuelto, limpiando contexto de modelo")
-        ctx.state_manager.update_state(ctx.contact_id, {
-            'modelo': None,
-            'alias_modelo': None,
-            'model_found': False,
-            'updated_at': datetime.now().isoformat(),
-        })
-
+    if not modelo:
+        texto_modelo_llm = ctx.entidades_detectadas.get('modelo', '')
+        logger.warning(
+            f"⚠️ Modelo no resuelto por clasificador "
+            f"(texto detectado: '{texto_modelo_llm}'), consultando LLM para aclaración/derivación"
+        )
         decision = _decidir_aclaracion_o_derivacion_llm(ctx, texto_modelo_llm)
         accion = decision.get("accion")
 
@@ -101,8 +80,6 @@ def handle(ctx: IntentContext) -> Optional[dict]:
                 "Te voy a poner en contacto con un asesor para que te ayude directamente."
             )
             send_message_to_ghl(ctx.contact_id, mensaje, ctx.channel)
-            # TODO: cuando exista un mecanismo formal de derivación
-            # (tag GHL / campo de estado / webhook), invocarlo acá.
             return {
                 "success": True,
                 "response": mensaje,
@@ -131,7 +108,8 @@ def handle(ctx: IntentContext) -> Optional[dict]:
     # ============================================
     # 2. LEER PRODUCTO YA RESUELTO (si lo hay) — nunca resolver acá
     # ============================================
-    producto_pedido = ctx.resolution.get('producto')
+    productos_state = ctx.state.get('producto') or []
+    producto_pedido = productos_state[0] if productos_state else None
 
     # ============================================
     # 3. OBTENER CATÁLOGO DEL MODELO (todo el catálogo, sin filtrar por término)
@@ -157,8 +135,6 @@ def handle(ctx: IntentContext) -> Optional[dict]:
             ctx.state_manager.update_state(ctx.contact_id, {'es_aclaracion': False, 'intentos_producto': 0})
             return _fallback_catalogo_modelo(ctx, modelo)
 
-        # Solo se aporta la bandera: el Gate del turno siguiente decide,
-        # con esto, si 'producto' sobrevive o se limpia.
         ctx.state_manager.update_state(ctx.contact_id, {
             'es_aclaracion': True,
             'intentos_producto': intentos_prod,
@@ -292,8 +268,6 @@ RESPONDÉ ÚNICAMENTE CON ESTE JSON, SIN TEXTO ADICIONAL:
 
     except (json.JSONDecodeError, KeyError, IndexError) as e:
         logger.error(f"❌ Error parseando decisión de aclaración/derivación de modelo: {e}")
-        # Fallback defensivo: ante error, preferimos pedir aclaración
-        # antes que derivar de más.
         return {
             "accion": "pedir_aclaracion",
             "mensaje": f"No reconozco el modelo o categoría \"{texto_modelo_llm}\". ¿Podrías confirmarme el nombre exacto?",
@@ -301,11 +275,17 @@ RESPONDÉ ÚNICAMENTE CON ESTE JSON, SIN TEXTO ADICIONAL:
         }
 
 
-def _decidir_accion_llm(ctx: IntentContext, modelo: str, producto_pedido: Optional[str], productos_modelo: List[Dict]) -> Dict:
+def _decidir_accion_llm(
+    ctx: IntentContext,
+    modelo: str,
+    producto_pedido: Optional[str],
+    productos_modelo: List[Dict],
+) -> Dict:
     """
-    Llamada única al LLM: decide la acción (buscar_producto / pedir_aclaracion /
-    fallback_catalogo) razonando sobre el historial completo, y si corresponde,
-    selecciona los ids que matchean lo pedido por el cliente.
+    Llamada única al LLM: decide la acción (buscar_producto /
+    pedir_aclaracion / fallback_catalogo) razonando sobre el historial
+    completo, y si corresponde, selecciona los ids que matchean lo
+    pedido por el cliente.
     """
     productos_texto = "\n".join(
         f"- {p.get('id')}: {p.get('nombre', '')}"
@@ -321,12 +301,14 @@ def _decidir_accion_llm(ctx: IntentContext, modelo: str, producto_pedido: Option
         intencion=ctx.intencion,
         historial_texto=ctx.historial_texto,
         productos_texto=productos_texto,
+        intentos_previos=ctx.state.get('intentos_producto', 0),
     )
 
     logger.info(
         f"📝 Prompt decisión de catálogo armado | modelo={modelo} | "
-        f"productos_en_catalogo={len(productos_modelo)} | "
-        f"producto_pedido={producto_pedido!r}"
+    f"productos_en_catalogo={len(productos_modelo)} | "
+    f"producto_pedido={producto_pedido!r} | "
+    f"intentos_previos={ctx.state.get('intentos_producto', 0)}"
     )
 
     try:
@@ -347,7 +329,11 @@ def _decidir_accion_llm(ctx: IntentContext, modelo: str, producto_pedido: Option
         data['ids_seleccionados'] = ids
         data['es_aclaracion'] = bool(data.get('es_aclaracion', False))
 
-        logger.info(f"🎯 Acción: {data.get('accion')} | es_aclaracion: {data['es_aclaracion']} | Ids: {ids} | Razón: {data.get('razon', '')}")
+        logger.info(
+            f"🎯 Acción: {data.get('accion')} | "
+            f"es_aclaracion: {data['es_aclaracion']} | "
+            f"Ids: {ids} | Razón: {data.get('razon', '')}"
+        )
         return data
 
     except (json.JSONDecodeError, KeyError, IndexError) as e:
@@ -355,7 +341,11 @@ def _decidir_accion_llm(ctx: IntentContext, modelo: str, producto_pedido: Option
         return {"accion": "fallback_catalogo", "ids_seleccionados": [], "es_aclaracion": False, "razon": "error_parseo"}
 
 
-def _fallback_catalogo_modelo(ctx: IntentContext, modelo: str, mensaje_intro: Optional[str] = None) -> dict:
+def _fallback_catalogo_modelo(
+    ctx: IntentContext,
+    modelo: str,
+    mensaje_intro: Optional[str] = None,
+) -> dict:
     """Respuesta final del turno cuando no hay match posible. Sin reintentos."""
     catalog_info = get_catalog_url_for_model(modelo)
 

@@ -30,3 +30,5 @@ def get_queue(name: str = "default") -> Queue:
 QUEUE_DEFAULT  = "default"
 QUEUE_AI       = "ai_tasks"
 QUEUE_HIGH     = "high"
+QUEUE_REALTOR_COOL_LEADS = "ghl_cool_leads_queue"
+QUEUE_REALTOR_PENDING_REVIEWS = "ghl_pending_reviews_queue"

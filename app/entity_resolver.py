@@ -10,13 +10,31 @@ logger = logging.getLogger(__name__)
 
 class EntityResolver:
     """
-    Responsable exclusivo de resolver 'modelo' contra el catálogo de
-    términos/alias, y de obtener el catálogo de productos de ese modelo.
+    Utilidad de matching léxico contra el catálogo de términos/alias
+    (`terminos_semanticos` + `terminos_alias`).
 
-    NOTA DE DISEÑO: 'producto' ya NO se resuelve aquí por texto libre.
-    El producto se resuelve dentro del tool call del LLM, eligiendo sobre
-    un enum de productos reales (ver tasks.py). Este resolver no necesita
-    saber nada sobre producto.
+    ROL ACTUAL (post-clasificador unificado): este módulo YA NO participa
+    en el flujo caliente de resolución de intención. Tanto 'modelo' como
+    'producto' se resuelven ahora en una sola pasada por el LLM
+    clasificador (ver `app/classifier.py`), que hace matching semántico
+    contra el diccionario de términos y devuelve el término canónico
+    directamente. `tasks.py` valida esa salida con exact-match
+    determinístico (`normalize_text` + comparación contra el set de
+    términos cacheado), sin volver a pasar por `buscar_modelo`/
+    `buscar_productos`.
+
+    Los métodos de matching aproximado (`buscar_modelo`, `buscar_productos`,
+    `_text_matches`, `_calculate_priority`) se conservan como utilidades
+    de soporte para la cola de revisión de términos no resueltos: cuando
+    el clasificador devuelve un texto que no matchea exacto contra ningún
+    término canónico, estas funciones se usan offline para sugerir
+    "esto probablemente es alias de X" y acelerar la revisión manual.
+    No bloquean ningún turno de conversación.
+
+    `resolver_modelo()` y `resolver_productos_alias()` quedan como código
+    sin consumidor en el flujo caliente (ver docstring de cada uno) —
+    no reintroducir su llamada desde `tasks.py`/handlers por costumbre;
+    esa responsabilidad es ahora exclusiva del clasificador.
     """
 
     def __init__(self):
@@ -36,8 +54,12 @@ class EntityResolver:
     def buscar_modelo(self, texto: str) -> Optional[Dict[str, Any]]:
         """
         Busca el MEJOR match de tipo 'modelo' en el catálogo de
-        términos/alias. Único método de matching usado en todo el pipeline
-        (Gate 2.5 y segunda pasada post-LLM llaman a este mismo método).
+        términos/alias mediante matching léxico aproximado (substring +
+        límites de palabra + prioridad por especificidad).
+
+        Uso actual: soporte offline para la cola de términos no resueltos
+        (sugerir candidato de alias). Ya no es llamado desde el flujo
+        de resolución de intención (eso lo hace el LLM clasificador).
         """
         if not texto:
             return None
@@ -75,6 +97,9 @@ class EntityResolver:
         si un alias más largo cubre el mismo tramo de texto que uno más corto
         (ej. "la instalacion" contiene a "instalacion"), solo se conserva el
         más largo/específico.
+
+        Uso actual: soporte offline para la cola de términos no resueltos.
+        Ya no es llamado desde el flujo de resolución de intención.
         """
         if not texto:
             return []
@@ -112,13 +137,16 @@ class EntityResolver:
 
         return aceptados
 
-
     def resolver_productos_alias(self, texto: str) -> List[Dict[str, str]]:
         """
-        Versión de resolver_modelo() para producto: NO devuelve un único
-        'mejor' match ni asume estado persistente — solo resuelve lo que
-        esté explícitamente en el mensaje actual, para normalizarlo antes
-        de la llamada al LLM. No hay 'producto heredado' entre turnos.
+        [SIN CONSUMIDOR EN EL FLUJO CALIENTE — ver docstring de la clase]
+
+        Antes usado como Gate 2.7 (resolución de alias de producto previa
+        al LLM). Reemplazado por la resolución semántica del clasificador
+        unificado (`app/classifier.py`) + validación exact-match en
+        `tasks.py`. Se conserva por si conviene reusar esta forma de salida
+        (`{'producto': ..., 'alias': ...}`) desde la cola de no-resueltos;
+        no reintroducir su llamada desde `tasks.py`/handlers.
         """
         matches = self.buscar_productos(texto)
         resueltos = [{'producto': m['termino'], 'alias': m['pattern']} for m in matches]
@@ -195,9 +223,14 @@ class EntityResolver:
 
     def resolver_modelo(self, texto: str) -> Optional[Dict[str, str]]:
         """
-        Busca el término de modelo en `texto`. Devuelve el modelo resuelto
-        junto con el alias/pattern real que hizo match — necesario para
-        poder normalizar ese alias en el mensaje antes de la llamada al LLM.
+        [SIN CONSUMIDOR EN EL FLUJO CALIENTE — ver docstring de la clase]
+
+        Antes usado como Gate 2.5 (resolución de modelo previa al LLM).
+        Reemplazado por la resolución semántica del clasificador unificado
+        (`app/classifier.py`) + validación exact-match en `tasks.py`.
+        Se conserva por si conviene reusar esta forma de salida
+        (`{'modelo': ..., 'alias': ...}`) desde la cola de no-resueltos;
+        no reintroducir su llamada desde `tasks.py`/handlers.
         """
         if not texto:
             return None
@@ -208,7 +241,7 @@ class EntityResolver:
 
         modelo = match['termino']
         alias = match['pattern']
-        logger.info(f"✅ Gate 2.5: modelo '{modelo}' (alias: '{alias}')")
+        logger.info(f"✅ Modelo (matching aproximado, uso offline): '{modelo}' (alias: '{alias}')")
         return {'modelo': modelo, 'alias': alias}
 
 # ============================================

@@ -1,3 +1,4 @@
+# app/intenciones/busqueda_producto_generica.py
 """
 Handler para la intención busqueda_producto_generica.
 
@@ -8,8 +9,17 @@ Esta rama resuelve ÚNICAMENTE por producto (sin cruce con modelo):
   - Si existe ambigüedad semántica (varias familias de producto distintas
     que calzan con el término), se gestiona la aclaración.
   - Si no hay ningún candidato relacionado, se cae al fallback de catálogo.
-"""
 
+RESOLUCIÓN DE PRODUCTO: 'producto' llega ya resuelto y validado en
+ctx.state['producto'] (lista canónica), escrito por el clasificador
+unificado en tasks.py. Este handler nunca resuelve producto por su
+cuenta ni lo lee de ctx.entidades_detectadas ni de ctx.resolution.
+
+El branch de aclaración pendiente (sección 2) se mantiene: resuelve
+ambigüedad de *inventario* (varios SKUs para el mismo término), no
+ambigüedad de *término*. Es responsabilidad exclusiva del handler,
+no del clasificador.
+"""
 import json
 import logging
 from datetime import datetime
@@ -30,9 +40,14 @@ def handle(ctx: IntentContext) -> Optional[dict]:
     logger.info("🔍 Procesando consulta de catálogo por producto")
 
     # ============================================
-    # 1. LEER PRODUCTO YA RESUELTO (POR GATE 2.7)
+    # 1. LEER PRODUCTO YA RESUELTO — nunca resolver acá
+    #
+    # El clasificador unificado (tasks.py) ya resolvió y validó el
+    # producto contra el catálogo antes de despachar a este handler.
+    # ctx.state['producto'] es una lista canónica (puede ser vacía).
     # ============================================
-    producto_pedido = ctx.resolution.get('producto')
+    productos_state = ctx.state.get('producto') or []
+    producto_pedido = productos_state[0] if productos_state else None
 
     if not producto_pedido:
         mensaje = "¿Qué producto estás buscando?"
@@ -48,6 +63,11 @@ def handle(ctx: IntentContext) -> Optional[dict]:
 
     # ============================================
     # 2. RETOMAR ACLARACIÓN PENDIENTE
+    #
+    # Este branch resuelve ambigüedad de *inventario* (varios SKUs para
+    # el mismo término), no de *término*. El clasificador del turno
+    # anterior ya resolvió el término; acá se retoma la selección de
+    # SKU específico cuando quedó pendiente en el turno anterior.
     # ============================================
     aclaracion_pendiente = bool(ctx.state.get('es_aclaracion')) and bool(ctx.state.get('producto_candidatos'))
 
@@ -150,7 +170,6 @@ def _enviar_productos_resueltos(
             "para suscribirte y te avisamos apenas vuelvan a estar disponibles — "
             "*_esto no implica ninguna obligación de compra._*"
         ]
-
         for p in productos_a_enviar:
             if p.get('url'):
                 mensajes.append(f"{p['url']}\n*_AGOTADO_*, Suscríbete para avisarte cuando llegue.")
@@ -194,7 +213,8 @@ def _decidir_accion_llm(
     contexto_extra: Optional[str] = None,
 ) -> Dict:
     """
-    Invoca al LLM enviando los candidatos encontrados para que decida la acción a ejecutar.
+    Invoca al LLM enviando los candidatos encontrados para que decida
+    la acción a ejecutar.
     """
     productos_texto = "\n".join(
         f"- {p.get('id')}: {p.get('nombre', '')}"
@@ -236,7 +256,11 @@ def _decidir_accion_llm(
         data['ids_seleccionados'] = ids
         data['es_aclaracion'] = bool(data.get('es_aclaracion', False))
 
-        logger.info(f"🎯 Acción: {data.get('accion')} | es_aclaracion: {data['es_aclaracion']} | IDs: {ids} | Razón: {data.get('razon', '')}")
+        logger.info(
+            f"🎯 Acción: {data.get('accion')} | "
+            f"es_aclaracion: {data['es_aclaracion']} | "
+            f"IDs: {ids} | Razón: {data.get('razon', '')}"
+        )
         return data
 
     except (json.JSONDecodeError, KeyError, IndexError) as e:
@@ -258,7 +282,7 @@ def _fallback_catalogo(
     intro = mensaje_intro or (
         f"No encontré {etiqueta} en el catálogo. Te invito a revisar el catálogo general:"
     )
-    mensajes = [intro, "https://quinchau.com/repuestos-motos"]
+    mensajes = [intro, "https://quinchau.com"]
 
     send_multiple_messages(ctx.contact_id, mensajes, ctx.channel, delay=0.5)
 
