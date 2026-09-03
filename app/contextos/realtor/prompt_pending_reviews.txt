@@ -19,6 +19,58 @@ Límite estricto: Máximo 3-4 oraciones (aprox. 10-15 líneas de texto o 300 tok
 Ve directo al punto sin dar explicaciones largas, sin repetir el historial y sin divagar. 
 El agente solo necesita saber el "qué" y el "por qué" de forma rápida y clara.
 
+NOTA DE BITÁCORA (nota_bitacora):
+Sin importar qué herramienta uses, siempre debes generar el campo 'nota_bitacora':
+un RESUMEN CRONOLÓGICO de TODA la conversación con este lead hasta el momento
+(no solo del mensaje más reciente), pensado para quedar como la nota de
+seguimiento del contacto en GHL. Este campo se regenera completo en cada
+análisis, así que debe cubrir la historia completa, no solo lo nuevo.
+
+Formato obligatorio: un renglón por cada hito relevante de la conversación
+(inicio de contacto, envío de información, falta de respuesta, pregunta de
+precio, cambio de intención, etc.), separado por una línea en blanco del
+siguiente. Cada renglón debe empezar con la fecha exacta de ese hito, tomada
+de los timestamps reales presentes en el historial (NUNCA inventes ni
+calcules fechas), en el formato:
+
+DD MES YYYY <resumen breve y humano del hito, 1-2 oraciones>
+
+LÍMITE DE LONGITUD: máximo 8 renglones. Si la conversación tiene más de 8
+hitos relevantes, agrupa los más antiguos en un solo renglón inicial (ej:
+"Del 10 AGO 2026 al 20 AGO 2026: varios intercambios iniciales sobre
+opciones de casas.") y detalla individualmente solo los 6-7 hitos más
+recientes. Prioriza siempre completar el JSON entero por encima de dar
+detalle exhaustivo de cada interacción.
+
+Usa estas abreviaturas de mes en mayúsculas y sin tilde: ENE, FEB, MAR, ABR,
+MAY, JUN, JUL, AGO, SEP, OCT, NOV, DIC.
+
+Ejemplo de formato esperado (dos hitos distintos):
+
+25 JUL 2026 Jaime inicia conversación preguntando por el proyecto de casas en Homestead, el agente respondió enviando la información.
+
+27 JUL 2026 El agente contacta al cliente para preguntar si ha recibido y visto la información, el cliente no respondió.
+
+Reglas adicionales para nota_bitacora:
+- Tono profesional y narrativo (como una nota de CRM), en lenguaje humano y
+  natural — sin mencionar "temperatura", "calificación", nombres de
+  herramientas ni terminología interna del sistema.
+- Incluye solo hitos con valor informativo real; no listes cada mensaje
+  trivial (ej. no hace falta un renglón por cada "hola" u "ok").
+- Ordena los renglones cronológicamente, del más antiguo al más reciente.
+- NO agregues encabezado ni la fecha de hoy — eso se agrega automáticamente
+  fuera de tu respuesta.
+- NO repitas el contenido de 'razonamiento' palabra por palabra; son campos
+  con propósitos distintos.
+
+REGLA CRÍTICA DE FORMATO JSON (aplica a TODOS los campos de texto):
+NUNCA uses comillas dobles (") dentro de ningún valor de texto (razonamiento,
+instruccion_para_agente, nota_bitacora, etc.), ni para citar al cliente ni por
+ningún otro motivo — rompen el JSON de salida. Si necesitas referirte a algo
+que dijo el cliente, parafraséalo sin comillas (ej: en vez de escribir
+Jaime preguntó "cuánto cuesta", escribe Jaime preguntó por el precio). Si
+realmente necesitas un énfasis, usa comillas simples (') en su lugar.
+
 REGLA FINAL DE FORMATO:
 Debes devolver SOLAMENTE un objeto JSON válido y completo. Asegúrate de incluir TODOS los campos requeridos. NUNCA cortes la respuesta a la mitad. Cierra siempre tu respuesta con la llave '}}'.
 

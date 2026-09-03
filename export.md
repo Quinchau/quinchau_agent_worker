@@ -51,6 +51,7 @@ app/
     pending_reviews/
       ghl_helpers.py
       reasoning.py
+      tasks.py
   __init__.py
   agent_state.py
   agent.py
@@ -65,13 +66,13 @@ app/
   main.py
   models.py
   product_search_cache.py
+  prompt_clasificador_unificado.txt
   prompts.py
   redis_queue.py
   tasks.py
   test_bloque.py
   test_clasificador.py
   test_validar.py
-  ver_cola.py
   worker_realtor.py
   worker.py
 codigo_muerto/
@@ -108,82 +109,55 @@ test_search.py
 
 # Selected Files Content
 
-## app/contextos/realtor/__init__.py
+## app/realtor/pending_reviews/ghl_helpers.py
 
 ```py
+import logging
+import os
+from datetime import datetime, timezone
 
+import httpx
+
+logger = logging.getLogger(__name__)
+
+
+def actualizar_ultima_revision_ia(contact_id: str) -> None:
+    """
+    Actualiza el custom field 'ultima_revision_ia' en GHL con la fecha/hora actual.
+    """
+    # Usamos las variables genéricas o las específicas de Miami si existen
+    api_key = os.environ.get("GHL_PRIVATE_TOKEN_FRANCHESCA_QUINTERO_TEAM_MIAMI") or os.environ.get("GHL_PRIVATE_TOKEN")
+    cf_id = os.environ.get("GHL_CF_ULTIMA_REVISION_IA_ID")
+    
+    if not api_key or not cf_id:
+        logger.warning("⚠️ Faltan credenciales de GHL (GHL_PRIVATE_TOKEN o GHL_CF_ULTIMA_REVISION_IA_ID) para actualizar custom field")
+        return
+    
+    url = f"https://services.leadconnectorhq.com/contacts/{contact_id}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Version": "2021-07-28",
+        "Content-Type": "application/json",
+    }
+    
+    payload = {
+        "customFields": [
+            {
+                "id": cf_id,
+                "value": datetime.now(timezone.utc).isoformat()
+            }
+        ]
+    }
+    
+    try:
+        response = httpx.put(url, headers=headers, json=payload, timeout=10.0)
+        response.raise_for_status()
+        logger.info(f"✅ Custom field 'ultima_revision_ia' actualizado para {contact_id}")
+    except Exception as e:
+        logger.error(f"❌ Error actualizando custom field para {contact_id}: {e}")
 ```
 
-## app/contextos/realtor/prompt_cool_leads.txt
-
-```txt
-Sos un asistente que analiza el historial de conversación de un lead inmobiliario que lleva
-{days_inactive} días sin responder, para recomendar la próxima acción al vendedor humano.
-
-Tu rol es sugerir, no decidir. Siempre dejá un motivo claro y accionable.
-
-Reglas de análisis (nivel de interés):
-- Interés alto: el lead mostró intención concreta (preguntó precio, pidió visita, dio disponibilidad)
-  antes de desaparecer.
-  → crear_tarea con tipo_tarea="reactivacion", mensaje personalizado.
-- Interés medio: hubo intercambio genuino pero sin señales fuertes de intención de compra/alquiler.
-  → crear_tarea con tipo_tarea="reactivacion", seguimiento suave.
-- Interés bajo: respuestas cortas, dudas sin resolver, o desinterés implícito.
-  → crear_tarea con tipo_tarea="marcar_lost", sugiriendo al vendedor pasar el lead a Lost.
-- Interés nulo: spam, número equivocado, el lead ya cerró por otro medio, o pidió
-  explícitamente no ser contactado.
-  → descartar. No se crea tarea; el vendedor no necesita hacer nada con este lead.
-
-Reglas de umbral por inactividad (tienen prioridad sobre el nivel de interés,
-salvo que el nivel de interés sea nulo, en cuyo caso siempre corresponde descartar):
-
-1. Corte duro (más de 365 días): si el lead lleva más de un año sin responder ni
-   contactarse Y no calificó como interés nulo, corresponde crear_tarea con
-   tipo_tarea="marcar_lost", SIN EXCEPCIÓN — incluso si en su momento mostró interés
-   alto o concreto. Esta regla anula la posibilidad de sugerir reactivación.
-
-2. Corte estándar (más de 180 días): si el lead lleva más de 180 días inactivo,
-   no calificó como interés nulo, y NO mostró interés concreto (interés alto),
-   corresponde crear_tarea con tipo_tarea="marcar_lost".
-
-Orden de evaluación: primero verificá si el nivel de interés es nulo → descartar,
-sin importar los días. Si no es nulo, aplicá la regla de corte duro (365 días).
-Si no aplica, evaluá la regla de corte estándar (180 días). Si ninguna aplica,
-basá la recomendación en el nivel de interés (alto/medio/bajo).
-
-Instrucciones adicionales:
-- Basate únicamente en la información provista en el historial. No inventes datos,
-  fechas ni afirmaciones que no estén explícitas en los mensajes.
-- El historial puede incluir mensajes de más de una conversación; están ordenados
-  cronológicamente, pero pueden provenir de canales o campañas distintas.
-- Si corresponde crear tarea (reactivación o sugerencia de Lost), llamá a crear_tarea
-  con un título y cuerpo concretos, indicando el tipo_tarea correspondiente.
-- Si corresponde descartar, llamá a descartar con el motivo claro, dejando constancia
-  de por qué se considera interés nulo.
-
-Siempre completá "razonamiento" primero, en 2-4 oraciones, explicando en qué te basaste.
-
-Contacto: {contact_name}
-Total de mensajes: {total_messages}
-Días inactivo: {days_inactive}
-
-Historial:
-{historial_texto}
-```
-
-## app/contextos/realtor/prompt_pending_reviews.txt
-
-```txt
-
-```
-
-## app/realtor/cool_leads/__init__.py
-
-```py
-
-```
-
-## app/realtor/cool_leads/reasoning.py
+## app/realtor/pending_reviews/reasoning.py
 
 ```py
 import json
@@ -196,63 +170,66 @@ from app.llm_client import get_openrouter_client
 
 logger = logging.getLogger(__name__)
 
-PROMPT_PATH = Path(__file__).resolve().parents[2] / "contextos" / "realtor" / "prompt_cool_leads.txt"
+PROMPT_PATH = Path(__file__).resolve().parents[2] / "contextos" / "realtor" / "prompt_pending_reviews.txt"
 
-TOOLS = [
+TOOLS_PENDING_REVIEWS = [
     {
         "type": "function",
         "function": {
-            "name": "crear_tarea",
-            "description": (
-                "El vendedor debe tomar una acción sobre este lead: reactivarlo o marcarlo "
-                "como Lost. SIEMPRE se crea una tarea visible para el vendedor."
-            ),
+            "name": "generar_tarea_inmediata",
+            "description": "El lead requiere atención humana inmediata. Genera una tarea clara para el agente.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "razonamiento": {"type": "string", "description": "Análisis paso a paso antes de decidir."},
-                    "nivel_interes": {"type": "string", "enum": ["alto", "medio", "bajo"]},
-                    "tipo_tarea": {
+                    "razonamiento": {"type": "string","description": "Análisis MUY CONCISO. Máximo 3-4 oraciones (aprox. 10-15 líneas de texto o 300 tokens). Ve directo al grano: qué dijo el cliente y por qué se toma esta decisión."},
+                    "temperatura": {"type": "string", "enum": ["Caliente", "Tibio", "Frío", "No interesado"]},
+                    "interes": {"type": "string", "enum": ["Casa", "Townhouse", "Inversión", "Rentar", "No determinado"]},
+                    "calificacion_lead": {"type": "integer", "minimum": 1, "maximum": 10, "description": "1-10 basado en intención de compra."},
+                    "titulo_tarea": {"type": "string", "description": "Título corto y accionable."},
+                    "instruccion_para_agente": {"type": "string", "description": "Instrucción detallada. Si incluye un mensaje para enviar, redáctalo aquí aplicando las reglas de oro."}
+                },
+                "required": ["razonamiento", "temperatura", "interes", "calificacion_lead", "titulo_tarea", "instruccion_para_agente"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ia_puede_continuar",
+            "description": "El mensaje del cliente es simple y el bot puede manejarlo sin intervención humana inmediata.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "razonamiento": {"type": "string","description": "Análisis MUY CONCISO. Máximo 3-4 oraciones (aprox. 10-15 líneas de texto o 300 tokens). Ve directo al grano: qué dijo el cliente y por qué se toma esta decisión."},
+                    "titulo_tarea": {
                         "type": "string",
-                        "enum": ["reactivacion", "marcar_lost"],
                         "description": (
-                            "'reactivacion' si el lead vale la pena retomar. "
-                            "'marcar_lost' si corresponde sugerir al vendedor pasar el lead a Lost "
-                            "(por interés bajo o por regla de umbral de inactividad)."
-                        ),
-                    },
-                    "task_title": {"type": "string"},
-                    "task_body": {"type": "string"},
-                    "prioridad": {"type": "string", "enum": ["alta", "media", "baja"]},
-                    "dias_para_seguimiento": {"type": "integer"},
+                            "Título corto de una sugerencia de seguimiento OPCIONAL para el agente humano, "
+                            "detectada al leer la conversación (ej: '[Sugerencia] Intentar obtener correo', "
+                            "'[Sugerencia] Confirmar cita', '[Sugerencia] Reagendar llamada'). "
+                            "Usar string vacío '' si no hay ninguna sugerencia relevante en este momento."
+                        )
+                    }
                 },
-                "required": [
-                    "razonamiento", "nivel_interes", "tipo_tarea",
-                    "task_title", "task_body", "prioridad", "dias_para_seguimiento",
-                ],
-            },
-        },
+                "required": ["razonamiento", "titulo_tarea"]
+            }
+        }
     },
     {
         "type": "function",
         "function": {
-            "name": "descartar",
-            "description": (
-                "El vendedor NO debe tomar ninguna acción. No se crea tarea. "
-                "Usar SOLO para casos de interés nulo real: spam, número equivocado, "
-                "el lead ya cerró por otro medio, o pidió explícitamente no ser contactado."
-            ),
+            "name": "marcar_sin_accion",
+            "description": "El lead dijo STOP, no le llamen, o es spam. No se debe crear tarea ni contactar.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "razonamiento": {"type": "string", "description": "Análisis paso a paso antes de decidir."},
-                    "nivel_interes": {"type": "string", "enum": ["nulo"]},
-                    "motivo": {"type": "string", "description": "Motivo breve del descarte, para dejar registro."},
+                    "motivo": {"type": "string", "description": "Motivo del descarte."},
+                    "razonamiento": {"type": "string","description": "Análisis MUY CONCISO. Máximo 3-4 oraciones (aprox. 10-15 líneas de texto o 300 tokens). Ve directo al grano: qué dijo el cliente y por qué se toma esta decisión."},
                 },
-                "required": ["razonamiento", "nivel_interes", "motivo"],
-            },
-        },
-    },
+                "required": ["motivo", "razonamiento"]
+            }
+        }
+    }
 ]
 
 
@@ -261,270 +238,165 @@ def _get_static_prompt() -> str:
     return PROMPT_PATH.read_text(encoding="utf-8")
 
 
-def analyze_lead(contact_name: str, days_inactive: int, total_messages: int, historial_texto: str) -> dict:
+def analyze_pending_review(contact_name: str, historial_texto: str) -> dict:
     """
-    Corre el razonamiento del LLM sobre el historial de un lead.
-    NO atrapa excepciones (Modo B, §7.7): si el LLM falla, el job de RQ debe fallar visiblemente.
+    Corre el razonamiento del LLM sobre el historial de un lead con actividad reciente.
+    Incluye diagnóstico de JSON para depurar errores de formato del LLM.
     """
     prompt = _get_static_prompt().format(
         contact_name=contact_name,
-        days_inactive=days_inactive,
-        total_messages=total_messages,
         historial_texto=historial_texto,
     )
 
     client = get_openrouter_client()
-    logger.info(f"🧠 Analizando lead '{contact_name}' ({days_inactive} días inactivo)")
+    logger.info(f"🧠 Analizando pending review para '{contact_name}'")
+
+    model_name = os.environ.get("PENDING_REVIEWS_MODEL") or os.environ.get("COOL_LEADS_MODEL", "anthropic/claude-sonnet-5")
+    temperature = float(os.environ.get("PENDING_REVIEWS_TEMPERATURE") or os.environ.get("COOL_LEADS_TEMPERATURE", "0.3"))
+    max_tokens = int(os.environ.get("PENDING_REVIEWS_MAX_TOKENS") or os.environ.get("COOL_LEADS_MAX_TOKENS", "800"))
 
     response = client.chat.completions.create(
-        model=os.environ["COOL_LEADS_MODEL"],
-        temperature=float(os.environ.get("COOL_LEADS_TEMPERATURE", "0.3")),
-        max_tokens=int(os.environ.get("COOL_LEADS_MAX_TOKENS", "700")),
+        model=model_name,
+        temperature=temperature,
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
-        tools=TOOLS,
+        tools=TOOLS_PENDING_REVIEWS,
         tool_choice="required",
     )
 
     message = response.choices[0].message
     if not message.tool_calls:
         raise RuntimeError(
-            f"El modelo {os.environ['COOL_LEADS_MODEL']} ignoró tool_choice='required' "
-            f"y devolvió texto plano en lugar de una función. Contenido: {message.content}"
+            f"El modelo {model_name} ignoró tool_choice='required' y devolvió texto plano. "
+            f"Contenido: {message.content}"
         )
 
     tool_call = message.tool_calls[0]
-    args = json.loads(tool_call.function.arguments)
+    raw_arguments = tool_call.function.arguments
+    
+    # 👉 DIAGNÓSTICO DE JSON: Si el LLM genera JSON inválido, lo registramos para ver el error exacto.
+    try:
+        args = json.loads(raw_arguments)
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Error decodificando JSON del LLM: {e}")
+        logger.error(f"📄 Argumentos crudos recibidos del LLM:\n{raw_arguments}")
+        raise RuntimeError(f"El modelo devolvió JSON inválido en los argumentos de la herramienta. Error: {e}")
 
-    accion = "crear_tarea" if tool_call.function.name == "crear_tarea" else "descartar"
-
-    logger.info(
-        f"✅ Decisión: {accion} | tipo_tarea={args.get('tipo_tarea', 'n/a')} | "
-        f"interés={args.get('nivel_interes')} | {contact_name}"
-    )
+    accion = tool_call.function.name
+    logger.info(f"✅ Decisión: {accion} | {contact_name}")
 
     return {"accion": accion, **args}
 ```
 
-## app/realtor/cool_leads/tasks.py
+## app/realtor/pending_reviews/tasks.py
 
 ```py
 import logging
 import os
-from datetime import date, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 
-from app.realtor.cool_leads.reasoning import analyze_lead
+from app.realtor.pending_reviews.reasoning import analyze_pending_review
 
 logger = logging.getLogger(__name__)
 
-SUGGESTION_PREFIX = "[🤖 Sugerencia]"
-ACCIONES_VALIDAS = {"crear_tarea", "descartar"}
-DUE_DATE_HORA = "09:00 AM"  # hora fija para el Due de las tareas sugeridas
+ACCIONES_VALIDAS = {"generar_tarea_inmediata", "ia_puede_continuar", "marcar_sin_accion"}
+
+# 👉 Zona horaria de Miami (maneja automáticamente EST/EDT)
+MIAMI_TZ = ZoneInfo("America/New_York")
 
 
-def _ensure_suggestion_prefix(title: str) -> str:
+def process_pending_review(payload: dict) -> None:
     """
-    Garantiza que el título de la tarea comience con el prefijo de sugerencia AI.
-    Esto permite:
-    1. Que el vendedor distinga visualmente tareas generadas por el sistema.
-    2. Rollback masivo en GHL filtrando por este prefijo.
-    3. Medición de efectividad (tareas AI completadas vs ignoradas).
+    Entrypoint del job RQ para Pending Reviews.
+    Procesa leads con actividad reciente y oportunidad abierta.
+    Delega la actualización del custom field al Workflow de GHL a través del webhook.
     """
-    if not title:
-        return SUGGESTION_PREFIX
-    if title.startswith(SUGGESTION_PREFIX):
-        return title
-    return f"{SUGGESTION_PREFIX} {title}"
-
-
-def _build_due_date(dias_seguimiento: int) -> str:
-    """
-    Calcula el Due Date ya formateado como lo exige GHL (MM-DD-YYYY HH:MM AM/PM).
-
-    IMPORTANTE: el workflow de GHL mapea el campo DUE DATE directamente desde el
-    payload del webhook, sin ningún cálculo intermedio. Antes se le pasaba
-    `dias_seguimiento` (un entero crudo) y GHL, al no poder parsearlo como fecha,
-    caía a epoch 0 → "Dec 31 1969, 7:00 PM (EDT)". Por eso acá resolvemos la
-    fecha final nosotros mismos, en el formato exacto que GHL espera.
-
-    - reactivacion: hoy + dias_seguimiento (mínimo 1 día).
-    - marcar_lost: no hay "seguimiento" real (el LLM suele mandar 0), pero la
-      tarea igual necesita un Due válido y cercano → hoy + 1 día.
-    """
-    dias_para_due = dias_seguimiento if dias_seguimiento > 0 else 1
-    due_date_dt = date.today() + timedelta(days=dias_para_due)
-    return f"{due_date_dt.strftime('%m-%d-%Y')} {DUE_DATE_HORA}"
-
-
-def process_cool_lead(payload: dict) -> None:
-    """
-    Entrypoint del job RQ.
-    Modo B (§7.7): no atrapamos excepciones acá — si algo falla, el job debe quedar visible
-    en FailedJobRegistry para reintento o revisión manual.
-
-    - accion="crear_tarea": SIEMPRE se crea una tarea visible para el vendedor (ya sea
-      para reactivar el lead o para sugerirle marcarlo como Lost, según tipo_tarea).
-    - accion="descartar": NO se crea tarea. El vendedor no necesita hacer nada; solo
-      se deja registro del motivo para auditoría.
-    """
-    webhook_url = os.environ.get("COOL_LEADS_WEBHOOK_URL")
+    webhook_url = os.environ.get("PENDING_REVIEWS_WEBHOOK_URL")
     if not webhook_url:
-        raise RuntimeError("COOL_LEADS_WEBHOOK_URL no está seteada en el entorno del Worker.")
+        raise RuntimeError("PENDING_REVIEWS_WEBHOOK_URL no está seteada en el entorno del Worker.")
 
-    lead_id = payload.get("cool_lead_id") or payload.get("task_id", "unknown_id")
+    task_id = payload.get("task_id", "unknown_id")
 
     try:
         contact_id = payload["contact_id"]
         contact_name = payload["contact_name"]
+        historial_texto = payload["historial_texto"]
     except KeyError as e:
-        logger.error(f"❌ Payload incompleto | lead_id={lead_id} | falta clave={e} | payload={payload}")
+        logger.error(f"❌ Payload incompleto | task_id={task_id} | falta clave={e}")
         raise
 
-    logger.info(f"📩 Job recibido | contact_id={contact_id} | lead_id={lead_id}")
+    logger.info(f"📩 Job recibido | contact_id={contact_id} | task_id={task_id}")
 
-    result = analyze_lead(
+    # 1. Analizar con el LLM
+    result = analyze_pending_review(
         contact_name=contact_name,
-        days_inactive=payload["days_inactive"],
-        total_messages=payload["total_messages"],
-        historial_texto=payload["historial_texto"],
+        historial_texto=historial_texto,
     )
 
     logger.info(f"🧠 Razonamiento LLM | {contact_name}: {result.get('razonamiento', 'N/A')}")
 
     accion = result.get("accion")
     if accion not in ACCIONES_VALIDAS:
-        logger.warning(f"⚠️ Acción inesperada del LLM: {accion!r} | lead_id={lead_id} | {contact_name}")
-        accion = "descartar"
+        logger.warning(f"⚠️ Acción inesperada del LLM: {accion!r} | task_id={task_id} | {contact_name}")
+        accion = "marcar_sin_accion"
 
-    dias_seguimiento_raw = result.get("dias_para_seguimiento", 0)
-    try:
-        dias_seguimiento = max(0, min(30, int(dias_seguimiento_raw)))
-    except (TypeError, ValueError):
-        logger.warning(f"⚠️ dias_para_seguimiento no numérico: {dias_seguimiento_raw!r} | {contact_name}")
-        dias_seguimiento = 0
+    # 👉 Fecha y hora exacta de la revisión de la IA en HORA DE MIAMI
+    # Formato MM-DD-YYYY HH:MM:SS (compatible con la mayoría de parsers de GHL)
+    fecha_hora_revision = datetime.now(MIAMI_TZ).strftime("%m-%d-%Y %H:%M:%S")
 
-    tipo_tarea = result.get("tipo_tarea", "")
+    # 2. Construir payload para el webhook
+    # NOTA: "task_title" siempre viaja en el payload (poblado o "") en las tres ramas,
+    # para que el workflow de GHL nunca reciba la key ausente y falle al mapear.
+    if accion == "generar_tarea_inmediata":
+        webhook_payload = {
+            "task_id": task_id,
+            "contact_id": contact_id,
+            "contact_name": contact_name,
+            "accion": "crear_tarea",
+            "temperatura": result.get("temperatura", "No determinado"),
+            "interes": result.get("interes", "No determinado"),
+            "calificacion_lead": result.get("calificacion_lead", 5),
+            "task_title": result.get("titulo_tarea", ""),
+            "task_body": result.get("instruccion_para_agente", ""),
+            "razonamiento": result.get("razonamiento", ""),
+            "custom_field_value": fecha_hora_revision,
+        }
+    elif accion == "ia_puede_continuar":
+        temperatura = result.get("temperatura", "No determinado")
+        # Enriquecemos el razonamiento con la temperatura para que el agente tenga contexto rápido en GHL
+        razonamiento_con_temperatura = f"Temperatura: {temperatura}\n\n{result.get('razonamiento', '')}"
 
-    if accion == "crear_tarea":
-        # Cubre ambos casos: reactivación y sugerencia de marcar Lost.
-        # El contenido siempre viene del LLM — no se hardcodea texto acá.
-        final_title = _ensure_suggestion_prefix(result.get("task_title", ""))
-        final_body = result.get("task_body") or "Sin cuerpo especificado por el LLM."
-        if not result.get("task_title") or not result.get("task_body"):
-            logger.warning(
-                f"⚠️ task_title/task_body vacío para accion=crear_tarea | "
-                f"tipo_tarea={tipo_tarea} | {contact_name}"
-            )
-        due_date = _build_due_date(dias_seguimiento)
-    else:
-        # descartar: no se crea tarea. Campos de tarea vacíos a propósito;
-        # el workflow de GHL no debe consumirlos en esta rama.
-        final_title = ""
-        final_body = ""
-        due_date = ""
+        webhook_payload = {
+            "task_id": task_id,
+            "contact_id": contact_id,
+            "contact_name": contact_name,
+            "accion": "ia_continua",
+            "task_title": result.get("titulo_tarea", ""),  # Sugerencia libre del LLM, o "" si no aplica
+            "razonamiento": razonamiento_con_temperatura,
+            "custom_field_value": fecha_hora_revision,
+        }
+    else:  # marcar_sin_accion
+        webhook_payload = {
+            "task_id": task_id,
+            "contact_id": contact_id,
+            "contact_name": contact_name,
+            "accion": "descartar",
+            "task_title": "",  # Nunca aplica una sugerencia aquí
+            "motivo": result.get("motivo", ""),
+            "razonamiento": result.get("razonamiento", ""),
+            "custom_field_value": fecha_hora_revision,
+        }
 
-    webhook_payload = {
-        "cool_lead_id": lead_id,
-        "contact_id": contact_id,
-        "contact_name": contact_name,
-        "accion": accion,  # "crear_tarea" o "descartar"
-        "tipo_tarea": tipo_tarea,  # "reactivacion" | "marcar_lost" | "" (si descartar)
-        "nivel_interes": result.get("nivel_interes", "desconocido"),
-        "task_title": final_title,
-        "task_body": final_body,
-        "motivo_descarte": result.get("motivo", ""),
-        "dias_seguimiento": dias_seguimiento,  # se conserva por compatibilidad/debug
-        "due_date": due_date,  # <-- nuevo: ya formateado para GHL (MM-DD-YYYY HH:MM AM/PM)
-        "custom_field_value": date.today().strftime("%m-%d-%Y"),
-    }
-
+    # 3. Enviar webhook
     logger.info(f"📦 Webhook payload: {webhook_payload}")
-    logger.info(f"🚀 Disparando webhook | accion={accion} | tipo_tarea={tipo_tarea} | {contact_name}")
+    logger.info(f"🚀 Disparando webhook | accion={accion} | {contact_name}")
 
     response = httpx.post(webhook_url, json=webhook_payload, timeout=15)
     response.raise_for_status()
 
     logger.info(f"✅ Webhook OK | {contact_name} | trigger_id={response.json().get('id')}")
-```
-
-## app/realtor/pending_reviews/ghl_helpers.py
-
-```py
-
-```
-
-## app/realtor/pending_reviews/reasoning.py
-
-```py
-
-```
-
-## app/worker_realtor.py
-
-```py
-"""
-RQ Worker — Dedicado exclusivamente al procesamiento de trabajos del dominio Realtor (ej. Cool Leads).
-
-Arrancar localmente con:
-    python app/worker_realtor.py
-
-O en Docker con el comando definido en docker-compose (servicio quinchau-cool-leads-worker).
-Escucha únicamente las colas de Realtor.
-"""
-
-import os
-import sys
-import logging
-
-# ============================================
-# CONFIGURACIÓN DE LOGGING
-# ============================================
-DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-
-logging.basicConfig(
-    level=logging.DEBUG if DEBUG else logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-
-# ============================================
-# AGREGAR RUTA DEL PROYECTO AL PYTHONPATH
-# ============================================
-# Esto permite que los imports "from app.xxx" funcionen correctamente
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
-
-from rq import Worker
-from app.redis_queue import get_redis, QUEUE_REALTOR_COOL_LEADS
-
-if __name__ == "__main__":
-    redis_conn = get_redis()
-    
-    # Definición explícita de las colas que procesa este worker dedicado
-    queues = [QUEUE_REALTOR_COOL_LEADS]
-
-    logging.info("=" * 60)
-    logging.info("🚀 Worker Realtor iniciando")
-    logging.info(f"📂 ROOT_DIR: {ROOT_DIR}")
-    logging.info(f"📬 Escuchando cola(s): {queues}")
-    logging.info(f"🔧 DEBUG: {DEBUG}")
-    logging.info("=" * 60)
-    
-    # FIX: Eliminamos with_scheduler=True porque el Gate se encarga del encolado.
-    # El worker solo debe consumir jobs inmediatos de la cola.
-    worker = Worker(queues, connection=redis_conn)
-    
-    try:
-        worker.work()
-    except KeyboardInterrupt:
-        logging.info("🛑 Worker detenido manualmente (KeyboardInterrupt)")
-    except Exception as e:
-        logging.error(f"💥 Worker falló inesperadamente: {e}", exc_info=True)
-        raise
 ```
 

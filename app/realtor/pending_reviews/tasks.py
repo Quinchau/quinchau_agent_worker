@@ -14,12 +14,33 @@ ACCIONES_VALIDAS = {"generar_tarea_inmediata", "ia_puede_continuar", "marcar_sin
 # 👉 Zona horaria de Miami (maneja automáticamente EST/EDT)
 MIAMI_TZ = ZoneInfo("America/New_York")
 
+MESES_ABREV_ES = {
+    1: "ENE", 2: "FEB", 3: "MAR", 4: "ABR", 5: "MAY", 6: "JUN",
+    7: "JUL", 8: "AGO", 9: "SEP", 10: "OCT", 11: "NOV", 12: "DIC",
+}
+
+
+def _formatear_fecha_bitacora(dt: datetime) -> str:
+    """Ej: '01 SEP 2026'"""
+    return f"{dt.day:02d} {MESES_ABREV_ES[dt.month]} {dt.year}"
+
+
+def _construir_nota_bitacora(cuerpo: str, ahora_miami: datetime) -> str:
+    """
+    Antepone el encabezado fijo (con la fecha real del sistema) al cuerpo
+    generado por el LLM. El encabezado NUNCA lo redacta el modelo, para
+    evitar fechas alucinadas o formatos inconsistentes.
+    """
+    header = f"Bitacora realizada por AI el {_formatear_fecha_bitacora(ahora_miami)}"
+    return f"{header}\n\n{cuerpo}" if cuerpo else header
+
 
 def process_pending_review(payload: dict) -> None:
     """
     Entrypoint del job RQ para Pending Reviews.
     Procesa leads con actividad reciente y oportunidad abierta.
-    Delega la actualización del custom field al Workflow de GHL a través del webhook.
+    Delega la actualización del custom field y la creación de la nota de bitácora
+    al Workflow de GHL a través del webhook.
     """
     webhook_url = os.environ.get("PENDING_REVIEWS_WEBHOOK_URL")
     if not webhook_url:
@@ -50,13 +71,23 @@ def process_pending_review(payload: dict) -> None:
         logger.warning(f"⚠️ Acción inesperada del LLM: {accion!r} | task_id={task_id} | {contact_name}")
         accion = "marcar_sin_accion"
 
-    # 👉 Fecha y hora exacta de la revisión de la IA en HORA DE MIAMI
+    # 👉 Instante único de la revisión, en HORA DE MIAMI. Se reutiliza para el
+    # custom field y para el encabezado de la bitácora, así ambos quedan consistentes.
+    ahora_miami = datetime.now(MIAMI_TZ)
+
     # Formato MM-DD-YYYY HH:MM:SS (compatible con la mayoría de parsers de GHL)
-    fecha_hora_revision = datetime.now(MIAMI_TZ).strftime("%m-%d-%Y %H:%M:%S")
+    fecha_hora_revision = ahora_miami.strftime("%m-%d-%Y %H:%M:%S")
+
+    # 👉 Bitácora: encabezado fijo (construido en código) + cuerpo generado por el LLM
+    nota_bitacora = _construir_nota_bitacora(
+        cuerpo=result.get("nota_bitacora", ""),
+        ahora_miami=ahora_miami,
+    )
 
     # 2. Construir payload para el webhook
-    # NOTA: "task_title" siempre viaja en el payload (poblado o "") en las tres ramas,
-    # para que el workflow de GHL nunca reciba la key ausente y falle al mapear.
+    # NOTA: "task_title" y "nota_bitacora" siempre viajan en el payload (poblados o "")
+    # en las tres ramas, para que el workflow de GHL nunca reciba una key ausente y
+    # falle al mapear.
     if accion == "generar_tarea_inmediata":
         webhook_payload = {
             "task_id": task_id,
@@ -69,6 +100,7 @@ def process_pending_review(payload: dict) -> None:
             "task_title": result.get("titulo_tarea", ""),
             "task_body": result.get("instruccion_para_agente", ""),
             "razonamiento": result.get("razonamiento", ""),
+            "nota_bitacora": nota_bitacora,
             "custom_field_value": fecha_hora_revision,
         }
     elif accion == "ia_puede_continuar":
@@ -83,6 +115,7 @@ def process_pending_review(payload: dict) -> None:
             "accion": "ia_continua",
             "task_title": result.get("titulo_tarea", ""),  # Sugerencia libre del LLM, o "" si no aplica
             "razonamiento": razonamiento_con_temperatura,
+            "nota_bitacora": nota_bitacora,
             "custom_field_value": fecha_hora_revision,
         }
     else:  # marcar_sin_accion
@@ -94,6 +127,7 @@ def process_pending_review(payload: dict) -> None:
             "task_title": "",  # Nunca aplica una sugerencia aquí
             "motivo": result.get("motivo", ""),
             "razonamiento": result.get("razonamiento", ""),
+            "nota_bitacora": nota_bitacora,
             "custom_field_value": fecha_hora_revision,
         }
 
