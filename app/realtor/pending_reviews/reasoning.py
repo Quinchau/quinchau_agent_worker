@@ -67,21 +67,25 @@ def _get_static_prompt() -> str:
     return plantilla.replace(MARCADOR_OPCIONES, fragmentos)
 
 
-def _build_tools(tareas_pendientes_ghl: list[dict]) -> list[dict]:
+def _build_tools() -> list[dict]:
     """
-    Arma la lista de tools para esta llamada. 'actualizar_tarea_existente'
-    solo se agrega si hay al menos una tarea abierta con ID válido — de lo
-    contrario su 'enum' de IDs quedaría vacío y el schema sería inválido.
+    Arma la lista de tools para esta llamada. Las 4 tools se incluyen
+    SIEMPRE, sin condicionar 'actualizar_tarea_existente' a que existan
+    tareas abiertas: su schema ya no lleva un enum de IDs dinámico (esa
+    validación se movió a execute_handler), así que el array completo de
+    tools queda idéntico byte a byte en TODAS las llamadas.
+
+    Esto es necesario porque en el orden de serialización de Anthropic
+    (tools -> system -> messages), 'tools' precede al bloque_estatico
+    marcado con cache_control: si tools cambiara de una llamada a otra,
+    invalidaría el cache aunque el texto del prompt fuera idéntico.
     """
-    tools = [
-        generar_tarea_inmediata.get_schema(tareas_pendientes_ghl),
-        ia_puede_continuar.get_schema(tareas_pendientes_ghl),
-        marcar_sin_accion.get_schema(tareas_pendientes_ghl),
+    return [
+        generar_tarea_inmediata.get_schema(),
+        ia_puede_continuar.get_schema(),
+        marcar_sin_accion.get_schema(),
+        actualizar_tarea_existente.get_schema(),
     ]
-    ids_validos = [t.get("id") for t in tareas_pendientes_ghl if t.get("id")]
-    if ids_validos:
-        tools.append(actualizar_tarea_existente.get_schema(tareas_pendientes_ghl))
-    return tools
 
 
 def analyze_pending_review(
@@ -114,7 +118,7 @@ def analyze_pending_review(
         f"{historial_texto}"
     )
 
-    tools = _build_tools(tareas_pendientes_ghl)
+    tools = _build_tools()
     client = get_openrouter_client()
 
     model_name = os.environ.get("PENDING_REVIEWS_MODEL") or os.environ.get("COOL_LEADS_MODEL", "anthropic/claude-sonnet-5")
@@ -128,7 +132,7 @@ def analyze_pending_review(
             {
                 "type": "text",
                 "text": bloque_estatico,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             },
             {
                 "type": "text",

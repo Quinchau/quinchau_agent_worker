@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 NOMBRE_TOOL = "generar_tarea_inmediata"
 
 
-def get_schema(tareas_pendientes_ghl: list[dict]) -> dict:
+def get_schema() -> dict:
     return {
         "type": "function",
         "function": {

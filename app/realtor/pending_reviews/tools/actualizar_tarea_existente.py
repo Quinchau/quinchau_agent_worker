@@ -21,8 +21,15 @@ NOMBRE_TOOL = "actualizar_tarea_existente"
 GHL_BASE_URL = "https://services.leadconnectorhq.com"
 
 
-def get_schema(tareas_pendientes_ghl: list[dict]) -> dict:
-    ids_validos = [t.get("id") for t in tareas_pendientes_ghl if t.get("id")]
+def get_schema() -> dict:
+    """
+    Schema 100% estático — no depende de tareas_pendientes_ghl ni de
+    ningún otro dato del contacto. La validación del ID de la tarea a
+    actualizar contra las tareas reales del contacto se hace en
+    execute_handler(), no acá, para que este schema (y por lo tanto el
+    array completo de `tools`, que precede al bloque_estatico cacheado)
+    sea idéntico en todas las llamadas.
+    """
     return {
         "type": "function",
         "function": {
@@ -39,8 +46,11 @@ def get_schema(tareas_pendientes_ghl: list[dict]) -> dict:
                     "temperatura": TEMPERATURA_SCHEMA,
                     "id_tarea_a_actualizar": {
                         "type": "string",
-                        "enum": ids_validos,
-                        "description": "ID exacto de la tarea a actualizar. NUNCA inventes uno.",
+                        "description": (
+                            "ID exacto de la tarea a actualizar, tomado LITERALMENTE de la "
+                            "lista de TAREAS PENDIENTES YA ABIERTAS en el contexto de este "
+                            "contacto. NUNCA inventes uno ni lo tomes de otro contacto."
+                        ),
                     },
                     "nuevo_titulo": {
                         "type": "string",
@@ -104,6 +114,23 @@ def execute_handler(result: dict, ctx: ExecutionContext) -> dict:
     """
     ghl_task_id = str(result.get("id_tarea_a_actualizar", ""))
 
+    # --- Validación de ID contra las tareas reales de ESTE contacto ------
+    # Antes esto lo garantizaba el enum del schema. Al sacarlo (para
+    # mantener el schema estático y no romper el cache_control), esta
+    # verificación pasa a ser la única barrera contra un ID inventado
+    # por el modelo o, peor, un ID válido pero de OTRO contacto.
+    ids_validos = {str(t.get("id")) for t in ctx.tareas_pendientes_ghl if t.get("id")}
+    if not ghl_task_id or ghl_task_id not in ids_validos:
+        logger.error(
+            f"❌ id_tarea_a_actualizar={ghl_task_id!r} inválido para {ctx.contact_name}. "
+            f"IDs abiertos reales: {sorted(ids_validos)}"
+        )
+        raise ValueError(
+            f"El modelo devolvió id_tarea_a_actualizar={ghl_task_id!r}, que no está "
+            f"entre las tareas abiertas de {ctx.contact_name}."
+        )
+    # ---------------------------------------------------------------------
+
     if not ctx.ghl_token:
         logger.error("❌ CRÍTICO: ghl_token es None o vacío. No se puede actualizar la tarea en GHL.")
         raise ValueError("GHL_API_KEY no configurada en el entorno del worker")
@@ -127,9 +154,6 @@ def execute_handler(result: dict, ctx: ExecutionContext) -> dict:
         "title": str(result.get("nuevo_titulo", "")),
         "body": str(result.get("nueva_instruccion", "")),
     }
-    # Si el LLM dejó título/instrucción en "" (= "sin cambios" según el
-    # prompt), no lo mandamos: evita pisar el título/descripción actual en
-    # GHL con un valor vacío.
     payload_api_tarea = {k: v for k, v in payload_api_tarea.items() if v}
 
     nueva_fecha_limite_para_webhook = ""

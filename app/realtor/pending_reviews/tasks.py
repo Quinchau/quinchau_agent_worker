@@ -154,15 +154,19 @@ def process_pending_review(payload: dict[str, Any]) -> None:
             # Hito cerrado: se fusiona limpio con el historial
             bitacora_final = (
                 f"{bitacora_entradas_fijas}\n\n{entrada_formateada}".strip()
-                if bitacora_entradas_fijas else entrada_formateada
+                if bitacora_entradas_fijas else entrada_formateada.strip()
             )
             watermark_a_escribir = watermark_candidato   # el watermark SÍ avanza
             logger.info(f"🔒 Hito cerrado. Watermark avanza a {watermark_a_escribir} | {contact_name}")
         else:
-            bitacora_final = (
-                f"{bitacora_entradas_fijas}\n\n--- RECIENTE ---\n{entrada_formateada}".strip()
-                if bitacora_entradas_fijas else f"--- RECIENTE ---\n{entrada_formateada}"
-            )
+            # ✅ FIX: DELIMITADOR CONDICIONAL
+            # Solo usamos el delimitador si YA existe un historial previo.
+            # Si bitacora_entradas_fijas está vacío (primera ejecución), guardamos solo la nueva entrada.
+            if bitacora_entradas_fijas:
+                bitacora_final = f"{bitacora_entradas_fijas}\n\n--- RECIENTE ---\n{entrada_formateada}".strip()
+            else:
+                bitacora_final = entrada_formateada.strip()
+                
             # ✅ Si no hay watermark_anterior, usar el candidato para evitar None
             watermark_a_escribir = watermark_anterior if watermark_anterior else watermark_candidato
             logger.info(f"🔓 Hito abierto. Watermark se mantiene en {watermark_a_escribir} | {contact_name}")
